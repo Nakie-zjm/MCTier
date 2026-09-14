@@ -1,9 +1,9 @@
-//! Local file share and transfer commands.
 use super::shared::*;
 
 // ==================== 文件共享操作命令 ====================
 
 use serde::{Deserialize, Serialize};
+
 use std::path::Path;
 
 /// 文件信息结构
@@ -731,13 +731,6 @@ pub async fn open_folder(path: String) -> Result<(), String> {
         Err("不支持的操作系统".to_string())
     }
 }
-
-// ==================== Rust高性能文件传输命令 ====================
-
-// 注意：由于Rust文件传输模块的复杂性，暂时保留JavaScript实现
-// 未来可以考虑完全迁移到Rust后端以获得更好的性能
-
-// ==================== HTTP 文件共享命令 ====================
 
 /// 启动HTTP文件服务器
 #[tauri::command]

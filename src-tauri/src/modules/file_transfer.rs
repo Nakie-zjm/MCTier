@@ -536,7 +536,10 @@ async fn is_share_access_allowed(
         }
         !attempts.is_empty()
     });
-    if failures.get(&key).is_some_and(|attempts| attempts.len() >= MAX_PASSWORD_FAILURES) {
+    if failures
+        .get(&key)
+        .is_some_and(|attempts| attempts.len() >= MAX_PASSWORD_FAILURES)
+    {
         return false;
     }
 
@@ -546,7 +549,8 @@ async fn is_share_access_allowed(
     } else {
         // Capacity limits bookkeeping, never authorization for unrelated peers.
         if !failures.contains_key(&key) && failures.len() >= MAX_PASSWORD_FAILURE_KEYS {
-            let oldest = failures.iter()
+            let oldest = failures
+                .iter()
                 .min_by_key(|(_, attempts)| attempts.back().copied())
                 .map(|(key, _)| key.clone());
             if let Some(oldest) = oldest {
@@ -837,12 +841,21 @@ mod share_list_response_tests {
         {
             let mut failures = state.password_failures.lock().await;
             for index in 0..MAX_PASSWORD_FAILURE_KEYS {
-                let recorded = now - Duration::from_millis((MAX_PASSWORD_FAILURE_KEYS - index) as u64);
-                failures.insert((format!("share-{index}"), peer.ip()), VecDeque::from([recorded]));
+                let recorded =
+                    now - Duration::from_millis((MAX_PASSWORD_FAILURE_KEYS - index) as u64);
+                failures.insert(
+                    (format!("share-{index}"), peer.ip()),
+                    VecDeque::from([recorded]),
+                );
             }
         }
-        assert!(is_share_access_allowed(&state, "new-share", &share, peer, "secret-password").await);
-        assert_eq!(state.password_failures.lock().await.len(), MAX_PASSWORD_FAILURE_KEYS);
+        assert!(
+            is_share_access_allowed(&state, "new-share", &share, peer, "secret-password").await
+        );
+        assert_eq!(
+            state.password_failures.lock().await.len(),
+            MAX_PASSWORD_FAILURE_KEYS
+        );
         assert!(!is_share_access_allowed(&state, "new-share", &share, peer, "wrong").await);
         let failures = state.password_failures.lock().await;
         assert_eq!(failures.len(), MAX_PASSWORD_FAILURE_KEYS);
@@ -860,11 +873,21 @@ mod share_list_response_tests {
             assert!(!is_share_access_allowed(&state, &share.id, &share, peer, "wrong").await);
         }
         assert!(!is_share_access_allowed(&state, &share.id, &share, peer, "secret-password").await);
-        assert!(is_share_access_allowed(&state, &share.id, &share, "10.126.126.3:1234".parse().unwrap(), "secret-password").await);
+        assert!(
+            is_share_access_allowed(
+                &state,
+                &share.id,
+                &share,
+                "10.126.126.3:1234".parse().unwrap(),
+                "secret-password"
+            )
+            .await
+        );
         let key = (share.id.clone(), peer.ip());
-        state.password_failures.lock().await.insert(key.clone(), VecDeque::from([
-            Instant::now() - PASSWORD_FAILURE_WINDOW - Duration::from_secs(1)
-        ]));
+        state.password_failures.lock().await.insert(
+            key.clone(),
+            VecDeque::from([Instant::now() - PASSWORD_FAILURE_WINDOW - Duration::from_secs(1)]),
+        );
         assert!(is_share_access_allowed(&state, &share.id, &share, peer, "secret-password").await);
         assert!(!state.password_failures.lock().await.contains_key(&key));
         assert!(!is_share_access_allowed(&state, &share.id, &share, peer, "wrong").await);
@@ -878,13 +901,25 @@ mod share_list_response_tests {
         let state = state();
         *state.lobby_token.write() = Some("lobby-token".into());
         let peer = "10.126.126.2:1234".parse().unwrap();
-        let result = list_files(State(state.clone()), ConnectInfo(peer), AxumPath("missing".into()),
-            Query(HashMap::new()), HeaderMap::new()).await;
+        let result = list_files(
+            State(state.clone()),
+            ConnectInfo(peer),
+            AxumPath("missing".into()),
+            Query(HashMap::new()),
+            HeaderMap::new(),
+        )
+        .await;
         assert_eq!(result.err(), Some(StatusCode::UNAUTHORIZED));
         let mut headers = HeaderMap::new();
         headers.insert(LOBBY_TOKEN_HEADER, "lobby-token".parse().unwrap());
-        let result = list_files(State(state.clone()), ConnectInfo(peer), AxumPath("missing".into()),
-            Query(HashMap::new()), headers).await;
+        let result = list_files(
+            State(state.clone()),
+            ConnectInfo(peer),
+            AxumPath("missing".into()),
+            Query(HashMap::new()),
+            headers,
+        )
+        .await;
         assert_eq!(result.err(), Some(StatusCode::NOT_FOUND));
         assert!(state.password_failures.lock().await.is_empty());
     }

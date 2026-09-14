@@ -1,23 +1,30 @@
-//! Shared command state, path grants, and platform helpers.
-
 // Tauri Command 接口模块
 // 提供前端调用的所有命令接口
 
 pub(crate) use crate::modules::app_core::{AppCore, AppState as CoreAppState};
+
 pub(crate) use crate::modules::config_manager::UserConfig;
-pub(crate) use crate::modules::file_transfer::{
-    FileInfo as FileTransferFileInfo, SharedFolder, SharedFolderSummary,
-};
+
 pub(crate) use crate::modules::lobby_manager::{Lobby, Player};
+
 pub(crate) use crate::modules::voice_service::AudioDevice;
+
 pub(crate) use std::collections::HashMap;
+
 pub(crate) use std::sync::atomic::{AtomicBool, Ordering};
+
 pub(crate) use std::sync::Arc;
+
 pub(crate) use std::sync::Mutex as StdMutex;
+
 pub(crate) use std::sync::OnceLock;
+
 pub(crate) use tauri::Emitter;
+
 pub(crate) use tauri::Manager;
+
 pub(crate) use tauri::State;
+
 pub(crate) use tokio::sync::Mutex;
 
 /// 远程文件下载的取消标志注册表（task_id -> 取消标志）
@@ -27,20 +34,42 @@ pub(crate) fn download_cancels() -> &'static dashmap::DashMap<String, Arc<Atomic
 }
 
 pub(crate) const MAX_REMOTE_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
 pub(crate) const MAX_REMOTE_METADATA_BYTES: usize = 4 * 1024 * 1024;
+
 pub(crate) const MAX_REMOTE_BATCH_FILES: usize = 256;
+
 pub(crate) const MAX_REMOTE_BATCH_REQUEST_BYTES: usize = 64 * 1024;
+
 pub(crate) const MAX_REMOTE_BATCH_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
 pub(crate) const MAX_PATH_GRANTS: usize = 4096;
+
 pub(crate) const MAX_CHAT_TARGETS: usize = 64;
-pub(crate) const MAX_CHAT_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+
+pub(crate) const MAX_CHAT_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
+pub(crate) const MAX_CHAT_ATTACHMENT_RESPONSE_BYTES: usize = 90 * 1024 * 1024;
+
+pub(crate) fn require_secure_signaling(value: &str) -> Result<(), String> {
+    let url = reqwest::Url::parse(value).map_err(|_| "Invalid signaling URL")?;
+    if url.scheme() != "wss"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return Err("信令服务器必须使用 WSS 加密连接".into());
+    }
+    Ok(())
+}
 // 仅 Windows 凭据管理器路径使用；其他平台不落盘明文密码，因此这里不是死代码，
 // 而是平台无关声明配平台相关使用。
 #[cfg(windows)]
 pub(crate) const AUTO_LOBBY_CREDENTIAL_TARGET: &str = "MCTier:auto-lobby-password";
 
 #[cfg(windows)]
-pub(crate) fn read_auto_lobby_secret() -> Option<String> {
+pub(crate) fn read_auto_lobby_secret() -> Result<Option<String>, String> {
     use windows::core::PCWSTR;
     use windows::Win32::Security::Credentials::{
         CredFree, CredReadW, CREDENTIALW, CRED_TYPE_GENERIC,
@@ -52,19 +81,24 @@ pub(crate) fn read_auto_lobby_secret() -> Option<String> {
         .collect::<Vec<_>>();
     let mut credential: *mut CREDENTIALW = std::ptr::null_mut();
     unsafe {
-        CredReadW(
+        if let Err(error) = CredReadW(
             PCWSTR(target.as_ptr()),
             CRED_TYPE_GENERIC,
             0,
             &mut credential,
-        )
-        .ok()?;
-        let record = credential.as_ref()?;
+        ) {
+            if error.code() == windows::core::HRESULT::from_win32(1168) {
+                return Ok(None);
+            }
+            return Err("无法读取 Windows 凭据库".into());
+        }
+        let record = credential.as_ref().ok_or("Invalid credential record")?;
         let bytes =
             std::slice::from_raw_parts(record.CredentialBlob, record.CredentialBlobSize as usize);
-        let value = String::from_utf8(bytes.to_vec()).ok();
+        let value = String::from_utf8(bytes.to_vec());
         CredFree(credential.cast());
-        value.filter(|password| !password.is_empty())
+        let value = value.map_err(|_| "Invalid credential encoding")?;
+        Ok((!value.is_empty()).then_some(value))
     }
 }
 
@@ -101,25 +135,30 @@ pub(crate) fn write_auto_lobby_secret(password: &str) -> Result<(), String> {
 }
 
 #[cfg(not(windows))]
-pub(crate) fn auto_lobby_session_secret() -> &'static StdMutex<Option<String>> {
-    static SECRET: OnceLock<StdMutex<Option<String>>> = OnceLock::new();
-    SECRET.get_or_init(|| StdMutex::new(None))
-}
-
-#[cfg(not(windows))]
-pub(crate) fn read_auto_lobby_secret() -> Option<String> {
-    auto_lobby_session_secret()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone()
+pub(crate) fn read_auto_lobby_secret() -> Result<Option<String>, String> {
+    let entry = keyring::Entry::new("MCTier", "auto-lobby-password")
+        .map_err(|_| "System credential store unavailable")?;
+    match entry.get_password() {
+        Ok(value) => Ok(Some(value)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(_) => Err("Cannot read system credential".into()),
+    }
 }
 
 #[cfg(not(windows))]
 pub(crate) fn write_auto_lobby_secret(password: &str) -> Result<(), String> {
-    *auto_lobby_session_secret()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-        (!password.is_empty()).then(|| password.to_string());
+    let entry = keyring::Entry::new("MCTier", "auto-lobby-password")
+        .map_err(|_| "System credential store unavailable")?;
+    if password.is_empty() {
+        match entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => {}
+            Err(_) => return Err("Cannot remove saved password".into()),
+        }
+    } else {
+        entry
+            .set_password(password)
+            .map_err(|_| "Cannot save system credential")?;
+    }
     Ok(())
 }
 
@@ -230,54 +269,6 @@ pub(crate) fn path_grant_matches(grant: &PathGrant, access: PathAccess) -> bool 
         PathAccess::WriteDirectory => grant.write_directory,
         PathAccess::Open => grant.open,
     }
-}
-
-pub(crate) fn is_symlink_or_reparse_point(metadata: &std::fs::Metadata) -> bool {
-    if metadata.file_type().is_symlink() {
-        return true;
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::fs::MetadataExt;
-
-        // FILE_ATTRIBUTE_REPARSE_POINT. Junctions and other reparse points can
-        // redirect file operations outside the selected path.
-        return metadata.file_attributes() & 0x400 != 0;
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    false
-}
-
-pub(crate) fn is_windows_reserved_name(name: &str) -> bool {
-    let trimmed = name.trim_end_matches([' ', '.']);
-    let stem = trimmed.split('.').next().unwrap_or("").to_ascii_uppercase();
-    matches!(
-        stem.as_str(),
-        "CON"
-            | "PRN"
-            | "AUX"
-            | "NUL"
-            | "COM1"
-            | "COM2"
-            | "COM3"
-            | "COM4"
-            | "COM5"
-            | "COM6"
-            | "COM7"
-            | "COM8"
-            | "COM9"
-            | "LPT1"
-            | "LPT2"
-            | "LPT3"
-            | "LPT4"
-            | "LPT5"
-            | "LPT6"
-            | "LPT7"
-            | "LPT8"
-            | "LPT9"
-    )
 }
 
 #[cfg(windows)]
@@ -501,4 +492,63 @@ pub(crate) fn unix_system_command(name: &str) -> Result<std::path::PathBuf, Stri
 /// 应用状态包装器（用于 Tauri State）
 pub struct AppState {
     pub core: Arc<Mutex<AppCore>>,
+}
+
+// ==================== Rust高性能文件传输命令 ====================
+
+// 注意：由于Rust文件传输模块的复杂性，暂时保留JavaScript实现
+// 未来可以考虑完全迁移到Rust后端以获得更好的性能
+
+// ==================== HTTP 文件共享命令 ====================
+
+pub(crate) use crate::modules::file_transfer::{
+    FileInfo as FileTransferFileInfo, SharedFolder, SharedFolderSummary,
+};
+
+pub(crate) fn is_symlink_or_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        // FILE_ATTRIBUTE_REPARSE_POINT. Junctions and other reparse points can
+        // redirect extraction outside of the user-selected directory.
+        return metadata.file_attributes() & 0x400 != 0;
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    false
+}
+
+pub(crate) fn is_windows_reserved_name(name: &str) -> bool {
+    let trimmed = name.trim_end_matches([' ', '.']);
+    let stem = trimmed.split('.').next().unwrap_or("").to_ascii_uppercase();
+    matches!(
+        stem.as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
 }

@@ -3,6 +3,7 @@ import { build } from 'esbuild';
 import { createServer } from 'node:http';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import path from 'node:path';
+import fs from 'node:fs/promises';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const { chromium } = await import(pathToFileURL(path.join(process.argv[2], 'index.mjs')));
@@ -19,7 +20,7 @@ const compiled = await build({
     b.onLoad({ filter: /.*/, namespace: 'empty-css' }, () => ({ contents: '', loader: 'js' }));
     b.onResolve({ filter: /^@tauri-apps\// }, args => ({ path: args.path, namespace: 'native' }));
     b.onLoad({ filter: /.*/, namespace: 'native' }, () => ({ loader: 'js', contents:
-      `export const invoke=async()=>({}); export const readText=async()=>'';
+      `export const invoke=async(command,args)=>command==='protect_lobby_password' ? 'mctier-local-v1:AAAABBBBCCCC' : {}; export const readText=async()=>'';
        export const listen=async()=>()=>{}; export const emit=async()=>{};
        export const getCurrentWindow=()=>({}); export const convertFileSrc=x=>x;
        export const getVersion=async()=> '3.0.0';` }));
@@ -49,10 +50,12 @@ try {
   await page.getByTitle('Favorite lobbies', { exact: true }).click();
   await page.locator('.favorite-card').first().click();
   assert.equal(await page.locator('#lobby-connection_lobbyName').inputValue(), 'TestLobby');
-  assert.equal(await page.locator('#lobby-connection_password').inputValue(), '');
+  await page.waitForFunction(() => document.querySelector('#lobby-connection_password').value === '********');
+  assert.equal(await page.locator('#lobby-connection_password').inputValue(), '********');
+  assert.equal(await page.locator('#lobby-connection_password').evaluate(el => el.closest('.ant-input-affix-wrapper').querySelectorAll('.ant-input-password-icon').length), 0);
   assert.equal(await page.locator('#lobby-connection_playerName').inputValue(), 'Bob');
   const saved = await page.evaluate(() => JSON.parse(localStorage.getItem('mctier_favorite_lobbies')));
-  assert.equal(saved[0].password, undefined);
+  assert.equal(saved[0].password, 'mctier-local-v1:AAAABBBBCCCC');
   assert.equal(saved[0].playerName, undefined);
   await page.getByTitle('Favorite lobbies', { exact: true }).click();
   await page.getByRole('button', { name: '+ Add favorite lobby', exact: true }).click();
@@ -65,6 +68,11 @@ try {
   });
   assert.deepEqual(duplicates, []);
   assert.deepEqual(errors, []);
+  const artifacts = path.join(root, '.artifacts', 'password-voice');
+  await fs.mkdir(artifacts, { recursive: true });
+  await page.screenshot({ path: path.join(artifacts, 'favorite-password-desktop.png'), fullPage: true });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.screenshot({ path: path.join(artifacts, 'favorite-password-mobile.png'), fullPage: true });
   console.log('PASS: legacy favorite migration, actual lobby selection, active nickname preservation, isolated form inputs.');
 } finally {
   await browser?.close();

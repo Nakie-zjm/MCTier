@@ -2,7 +2,6 @@ import React, { useState, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Button, Space, Typography, Modal } from 'antd';
 import { invoke } from '@tauri-apps/api/core';
-import { listen } from '@tauri-apps/api/event';
 import { getVersion } from '@tauri-apps/api/app';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { open } from '@tauri-apps/plugin-shell';
@@ -56,45 +55,6 @@ export const MainWindow: React.FC = () => {
     });
   }, []);
 
-  // The backend emits the auto-lobby configuration once during startup. Keep
-  // an event subscription in addition to the settings fallback below: the
-  // event can arrive before/after MainWindow mounts depending on WebView
-  // startup timing, and previously it was silently dropped because no
-  // listener existed at all.
-  useEffect(() => {
-    let disposed = false;
-    let unlisten: (() => void) | undefined;
-    void listen<{
-      lobbyName?: unknown;
-      lobbyPassword?: unknown;
-      playerName?: unknown;
-      useDomain?: unknown;
-    }>('auto-lobby-config', (event) => {
-      if (disposed || (window as any).__autoLobbyTriggered) return;
-      const payload = event.payload ?? {};
-      const lobbyName = typeof payload.lobbyName === 'string' ? payload.lobbyName.trim() : '';
-      const playerName = typeof payload.playerName === 'string' ? payload.playerName.trim() : '';
-      const lobbyPassword = typeof payload.lobbyPassword === 'string' ? payload.lobbyPassword : '';
-      if (!lobbyName || !playerName) return;
-      (window as any).__autoLobbyTriggered = true;
-      (window as any).__autoLobbyConfig = {
-        lobbyName,
-        lobbyPassword,
-        playerName,
-        useDomain: payload.useDomain === true,
-      };
-      setFormMode('create');
-      setShowForm(true);
-    }).then((cleanup) => {
-      if (disposed) cleanup();
-      else unlisten = cleanup;
-    }).catch((error) => console.warn('监听自动大厅配置失败:', error));
-    return () => {
-      disposed = true;
-      unlisten?.();
-    };
-  }, []);
-
   // 监听 GPU 渲染设置变化的全局事件
   useEffect(() => {
     const handleGpuRenderingChange = (event: CustomEvent) => {
@@ -120,6 +80,8 @@ export const MainWindow: React.FC = () => {
   // 邀请 deep link：收到后切到加入模式并打开表单（LobbyForm 自行读取预填）
   useEffect(() => {
     const onDeepLink = () => {
+      (window as any).__autoLobbyTriggered = true;
+      delete (window as any).__autoLobbyConfig;
       setFormMode('join');
       setShowForm(true);
       // 再次派发，确保已挂载的 LobbyForm 也能立即读取
@@ -144,9 +106,11 @@ export const MainWindow: React.FC = () => {
   useEffect(() => {
     // 用全局标志确保整个应用生命周期内只触发一次，避免从大厅返回主界面时重复触发
     if ((window as any).__autoLobbyTriggered) return;
+    let disposed = false;
     const checkAutoLobby = async () => {
       try {
         const settings = await invoke<any>('get_settings');
+        if (disposed || (window as any).__autoLobbyTriggered) return;
         
         // 加载 GPU 渲染设置
         const gpuEnabled = settings.enableGpuRendering ?? true;
@@ -174,7 +138,7 @@ export const MainWindow: React.FC = () => {
     };
     // 延迟500ms等待窗口完全渲染
     const timer = setTimeout(checkAutoLobby, 500);
-    return () => clearTimeout(timer);
+    return () => { disposed = true; clearTimeout(timer); };
   }, []);
 
   // 监听版本错误并显示弹窗
@@ -220,11 +184,15 @@ export const MainWindow: React.FC = () => {
   }, [versionError, setVersionError]);
 
   const handleCreateLobby = () => {
+    (window as any).__autoLobbyTriggered = true;
+    delete (window as any).__autoLobbyConfig;
     setFormMode('create');
     setShowForm(true);
   };
 
   const handleJoinLobby = () => {
+    (window as any).__autoLobbyTriggered = true;
+    delete (window as any).__autoLobbyConfig;
     setFormMode('join');
     setShowForm(true);
   };
@@ -242,6 +210,8 @@ export const MainWindow: React.FC = () => {
   };
 
   const handleShowSettings = () => {
+    (window as any).__autoLobbyTriggered = true;
+    delete (window as any).__autoLobbyConfig;
     setShowSettings(true);
   };
 

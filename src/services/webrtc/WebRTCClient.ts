@@ -3716,20 +3716,8 @@ export class WebRTCClient {
   private async requestMicrophonePermission(notifyPermissionRequired = true): Promise<MediaStream> {
     try {
       console.log('🎤 正在请求麦克风权限...');
-      const preferredInput = audioDevices.getInputDeviceId();
-      // 启用浏览器/WebRTC 原生语音处理，优先抑制环境噪声和扬声器回声。
-      const audioConstraints: MediaTrackConstraints = {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
-      };
-      if (preferredInput) {
-        (audioConstraints as any).deviceId = { ideal: preferredInput };
-      }
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: audioConstraints,
-        video: false,
-      });
+      const { captureVoiceStream } = await import('../voice/nvidiaNoise');
+      const stream = await captureVoiceStream();
       console.log('✅ 麦克风权限已获取');
       return stream;
     } catch (error: any) {
@@ -3773,6 +3761,16 @@ export class WebRTCClient {
     this.micOpChain = run.catch(() => {
       /* 错误已在内部记录 */
     });
+    return run;
+  }
+
+  async refreshMicrophoneProcessing(): Promise<void> {
+    const run = this.micOpChain.then(async () => {
+      if (!this.desiredMicEnabled) return;
+      await this.applyMicState(false);
+      if (this.desiredMicEnabled) await this.applyMicState(true);
+    });
+    this.micOpChain = run.catch(() => undefined);
     return run;
   }
 

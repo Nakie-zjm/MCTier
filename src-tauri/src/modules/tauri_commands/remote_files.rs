@@ -1,4 +1,3 @@
-//! Authenticated remote file browsing and download commands.
 use super::shared::*;
 
 /// 获取远程共享列表（通过HTTP API）

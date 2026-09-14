@@ -1,4 +1,3 @@
-//! Screen viewer, danmaku, game HUD, and overlay commands.
 // ==================== 屏幕共享命令 ====================
 
 /// 打开屏幕查看窗口

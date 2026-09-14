@@ -1,5 +1,50 @@
-//! Lobby, voice, local configuration, and window commands.
 use super::shared::*;
+
+/// Open a user-supplied web URL with the operating system's default browser.
+/// Chat links are deliberately handled here instead of through the shell
+/// plugin's fixed-domain allowlist: the URL is parsed and constrained to HTTP(S)
+/// before it reaches a platform launcher.
+#[tauri::command]
+pub fn open_external_url(url: String) -> Result<(), String> {
+    if url.len() > 8192 || url.chars().any(|character| character.is_control()) {
+        return Err("链接格式无效".into());
+    }
+    let parsed = reqwest::Url::parse(url.trim()).map_err(|_| "链接格式无效")?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return Err("仅支持不带账号信息的 HTTP(S) 链接".into());
+    }
+
+    #[cfg(windows)]
+    {
+        std::process::Command::new(windows_system_command("explorer.exe"))
+            .arg(parsed.as_str())
+            .spawn()
+            .map_err(|error| format!("无法打开系统浏览器: {error}"))?;
+        return Ok(());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new(unix_system_command("open")?)
+            .arg(parsed.as_str())
+            .spawn()
+            .map_err(|error| format!("无法打开系统浏览器: {error}"))?;
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new(unix_system_command("xdg-open")?)
+            .arg(parsed.as_str())
+            .spawn()
+            .map_err(|error| format!("无法打开系统浏览器: {error}"))?;
+        return Ok(());
+    }
+    #[allow(unreachable_code)]
+    Err("当前系统不支持打开外部链接".into())
+}
 
 // ==================== 大厅操作命令 ====================
 
@@ -28,6 +73,8 @@ pub async fn create_lobby(
     app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Lobby, String> {
+    let password = crate::modules::secret_store::resolve(&password)?;
+    require_secure_signaling(&signaling_server)?;
     log::info!(
         "收到创建大厅命令: name={}, player={}, player_id={}, signaling_server={}, use_domain={:?}",
         name,
@@ -39,6 +86,14 @@ pub async fn create_lobby(
 
     let core = state.core.lock().await;
 
+    // Claim the transition while holding core: overlapping requests must not
+    // overwrite state or roll back a session owned by another request.
+    if matches!(
+        core.get_state().await,
+        CoreAppState::Connecting | CoreAppState::InLobby
+    ) {
+        return Err("大厅正在连接或已连接，请先退出当前大厅".to_string());
+    }
     // 更新应用状态为连接中
     core.set_state(CoreAppState::Connecting).await;
 
@@ -116,6 +171,8 @@ pub async fn create_lobby(
                 Err(e) => {
                     log::error!("❌ 启动P2P信令服务失败（创建大厅）: {}", e);
                     drop(p2p_svc);
+                    lobby_manager.lock().await.force_clear_state();
+                    let _ = network_service.lock().await.stop_easytier().await;
                     let core = state.core.lock().await;
                     core.set_state(CoreAppState::Error(format!("P2P信令服务启动失败: {}", e)))
                         .await;
@@ -152,10 +209,23 @@ pub async fn create_lobby(
             // LobbyManager may already contain a lobby when the later P2P
             // signaling step fails; leaving either behind makes the next
             // click fail immediately with AlreadyInLobby.
+            if matches!(e, crate::modules::lobby_manager::LobbyError::AlreadyInLobby) {
+                drop(lobby_mgr);
+                drop(network_svc);
+                state
+                    .core
+                    .lock()
+                    .await
+                    .set_state(CoreAppState::InLobby)
+                    .await;
+                return Err(e.to_string());
+            }
             lobby_mgr.force_clear_state();
             let _ = network_svc.stop_easytier().await;
 
             // 更新应用状态为错误
+            drop(lobby_mgr);
+            drop(network_svc);
             let core = state.core.lock().await;
             core.set_state(CoreAppState::Error(e.to_string())).await;
             drop(core);
@@ -190,6 +260,8 @@ pub async fn join_lobby(
     app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Lobby, String> {
+    let password = crate::modules::secret_store::resolve(&password)?;
+    require_secure_signaling(&signaling_server)?;
     log::info!(
         "收到加入大厅命令: name={}, player={}, player_id={}, signaling_server={}, use_domain={:?}",
         name,
@@ -201,6 +273,12 @@ pub async fn join_lobby(
 
     let core = state.core.lock().await;
 
+    if matches!(
+        core.get_state().await,
+        CoreAppState::Connecting | CoreAppState::InLobby
+    ) {
+        return Err("大厅正在连接或已连接，请先退出当前大厅".to_string());
+    }
     // 更新应用状态为连接中
     core.set_state(CoreAppState::Connecting).await;
 
@@ -281,6 +359,8 @@ pub async fn join_lobby(
                     log::error!("❌ 启动P2P信令服务失败（加入大厅）: {}", e);
                     // P2P信令服务启动失败应该返回错误，因为没有它就无法发现其他玩家
                     drop(p2p_svc);
+                    lobby_manager.lock().await.force_clear_state();
+                    let _ = network_service.lock().await.stop_easytier().await;
                     let core = state.core.lock().await;
                     core.set_state(CoreAppState::Error(format!("P2P信令服务启动失败: {}", e)))
                         .await;
@@ -315,10 +395,23 @@ pub async fn join_lobby(
 
             // Roll back partial setup so a failed join can be retried without
             // requiring an application restart or a separate force-stop.
+            if matches!(e, crate::modules::lobby_manager::LobbyError::AlreadyInLobby) {
+                drop(lobby_mgr);
+                drop(network_svc);
+                state
+                    .core
+                    .lock()
+                    .await
+                    .set_state(CoreAppState::InLobby)
+                    .await;
+                return Err(e.to_string());
+            }
             lobby_mgr.force_clear_state();
             let _ = network_svc.stop_easytier().await;
 
             // 更新应用状态为错误
+            drop(lobby_mgr);
+            drop(network_svc);
             let core = state.core.lock().await;
             core.set_state(CoreAppState::Error(e.to_string())).await;
             drop(core);
@@ -587,9 +680,14 @@ pub async fn get_config(state: State<'_, AppState>) -> Result<UserConfig, String
     let config_manager = core.get_config_manager();
     let config_mgr = config_manager.lock().await;
 
-    let config = config_mgr.get_config_clone();
-
-    log::debug!("返回配置: {:?}", config);
+    let mut config = config_mgr.get_config_clone();
+    if let Some(auto) = config.auto_lobby.as_mut() {
+        auto.lobby_password = auto
+            .lobby_password
+            .take()
+            .map(crate::modules::secret_store::protect_lobby_password)
+            .transpose()?;
+    }
 
     Ok(config)
 }
@@ -603,7 +701,17 @@ pub async fn get_config(state: State<'_, AppState>) -> Result<UserConfig, String
 /// * `Ok(())` - 更新成功
 /// * `Err(String)` - 错误信息
 #[tauri::command]
-pub async fn update_config(config: UserConfig, state: State<'_, AppState>) -> Result<(), String> {
+pub async fn update_config(
+    mut config: UserConfig,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    if let Some(auto) = config.auto_lobby.as_mut() {
+        auto.lobby_password = auto
+            .lobby_password
+            .take()
+            .map(crate::modules::secret_store::protect_lobby_password)
+            .transpose()?;
+    }
     log::info!("收到更新配置命令");
 
     let core = state.core.lock().await;

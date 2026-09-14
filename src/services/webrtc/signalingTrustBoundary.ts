@@ -129,7 +129,7 @@ export function isValidIceCandidate(value: unknown): boolean {
     return false;
   }
   if (
-    input.sdpMLineIndex != null &&
+    input.sdpMLineIndex !== null && input.sdpMLineIndex !== undefined &&
     (typeof input.sdpMLineIndex !== 'number' ||
       !Number.isSafeInteger(input.sdpMLineIndex) ||
       input.sdpMLineIndex < 0 ||
@@ -137,7 +137,8 @@ export function isValidIceCandidate(value: unknown): boolean {
   ) {
     return false;
   }
-  return input.sdpMid == null || (typeof input.sdpMid === 'string' && input.sdpMid.length <= 128);
+  return input.sdpMid === null || input.sdpMid === undefined ||
+    (typeof input.sdpMid === 'string' && input.sdpMid.length <= 128);
 }
 
 export function authenticatePeerMessage(

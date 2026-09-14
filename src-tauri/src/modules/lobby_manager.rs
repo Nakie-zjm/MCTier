@@ -207,7 +207,11 @@ impl LobbyManager {
                         attempt,
                         MAX_ATTEMPTS,
                         text,
-                        if transient { "，判定为瞬时错误" } else { "" }
+                        if transient {
+                            "，判定为瞬时错误"
+                        } else {
+                            ""
+                        }
                     );
                     last_error = Some(error);
                     if !transient || attempt == MAX_ATTEMPTS {
@@ -485,7 +489,8 @@ impl LobbyManager {
                 // No advanced settings have been persisted on a fresh install.
                 // The EasyTier default is DHCP, which is not available on the
                 // public node, so use a deterministic creator address here too.
-                let mut static_config = crate::modules::config_manager::EasyTierAdvancedConfig::default();
+                let mut static_config =
+                    crate::modules::config_manager::EasyTierAdvancedConfig::default();
                 static_config.use_global_config = false;
                 static_config.dhcp = false;
                 static_config.ipv4 = Some("10.126.126.1/24".to_string());
@@ -515,17 +520,17 @@ impl LobbyManager {
 
         // 启动 EasyTier 服务（统一启用魔法DNS），传递配置参数
         let virtual_ip = Self::start_easytier_with_retry(
-                network_service,
-                network_name,
-                network_key,
-                normalized_server_node,
-                player_name.clone(),
-                app_handle,
-                Some(global_config),
-                Some(creator_lobby_config),
-            )
-            .await
-            .map_err(|e| LobbyError::NetworkError(e.to_string()))?;
+            network_service,
+            network_name,
+            network_key,
+            normalized_server_node,
+            player_name.clone(),
+            app_handle,
+            Some(global_config),
+            Some(creator_lobby_config),
+        )
+        .await
+        .map_err(|e| LobbyError::NetworkError(e.to_string()))?;
 
         log::info!("虚拟域名已派生为身份指纹前缀");
 
@@ -769,17 +774,17 @@ impl LobbyManager {
 
         // 启动 EasyTier 服务（统一启用魔法DNS），传递配置参数
         let virtual_ip = Self::start_easytier_with_retry(
-                network_service,
-                network_name,
-                network_key,
-                normalized_server_node,
-                player_name.clone(),
-                app_handle,
-                Some(global_config),
-                Some(lobby_config),
-            )
-            .await
-            .map_err(|e| LobbyError::NetworkError(e.to_string()))?;
+            network_service,
+            network_name,
+            network_key,
+            normalized_server_node,
+            player_name.clone(),
+            app_handle,
+            Some(global_config),
+            Some(lobby_config),
+        )
+        .await
+        .map_err(|e| LobbyError::NetworkError(e.to_string()))?;
 
         log::info!("虚拟域名已派生为身份指纹前缀");
 

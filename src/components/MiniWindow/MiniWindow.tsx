@@ -126,7 +126,7 @@ async function buildInvitePoster(invite: LobbyInvite): Promise<HTMLCanvasElement
   roundRectPath(ctx, qx - 24, qy - 24, qrSize + 48, qrSize + 48, 22); ctx.fill();
   ctx.restore();
   const qc = document.createElement('canvas');
-  await drawQrWithLogo(qc, buildLobbyInviteLink(invite), qrSize);
+  await drawQrWithLogo(qc, await buildLobbyInviteLink(invite), qrSize);
   ctx.drawImage(qc, qx, qy);
 
   // 大厅名
@@ -134,7 +134,7 @@ async function buildInvitePoster(invite: LobbyInvite): Promise<HTMLCanvasElement
   ctx.fillText(invite.name, W / 2, qy + qrSize + 96);
 
   // 密码药丸
-  const pwdText = tl(`密码  ${invite.password || '（无）'}`, `Password  ${invite.password || '(none)'}`);
+  const pwdText = invite.password ? tl('加密邀请', 'Encrypted invitation') : tl('无密码大厅', 'Passwordless lobby');
   ctx.font = '22px "Microsoft YaHei", sans-serif';
   const pw = ctx.measureText(pwdText).width + 56;
   const px = (W - pw) / 2, py = qy + qrSize + 120;
@@ -349,7 +349,9 @@ export const MiniWindow: React.FC = () => {
   // 弹窗打开时把二维码（含圆角 Logo）渲染到画布
   useEffect(() => {
     if (showQrModal && lobbyInvite && qrCanvasRef.current) {
-      void drawQrWithLogo(qrCanvasRef.current, buildLobbyInviteLink(lobbyInvite), 240, 180);
+      const canvas = qrCanvasRef.current;
+      void buildLobbyInviteLink(lobbyInvite).then(link => drawQrWithLogo(canvas, link, 240, 180))
+        .catch(() => message.error(tl('生成邀请失败', 'Failed to generate invite')));
     }
   }, [showQrModal, lobbyInvite?.name, lobbyInvite?.password, lobbyInvite?.serverNode, lobbyInvite?.signalingServer]);
 
@@ -1199,7 +1201,7 @@ export const MiniWindow: React.FC = () => {
     if (!lobbyInvite) return;
     
     try {
-      const lobbyInfo = formatLobbyInviteText(lobbyInvite, getLanguage() === 'en' ? 'en' : 'zh');
+      const lobbyInfo = await formatLobbyInviteText(lobbyInvite, getLanguage() === 'en' ? 'en' : 'zh');
       
       await writeText(lobbyInfo);
       
@@ -2238,7 +2240,7 @@ export const MiniWindow: React.FC = () => {
               title={tl('复制可一键加入的邀请链接，发给好友在浏览器打开即可加入', 'Copy a one-click invite link; send it to a friend to open in a browser and join')}
               onClick={async () => {
                 if (!lobbyInvite) return;
-                const dl = buildLobbyInviteLink(lobbyInvite);
+                const dl = await buildLobbyInviteLink(lobbyInvite);
                 try { await writeText(dl); message.success(tl('邀请链接已复制，发给好友在浏览器打开即可加入', 'Invite link copied. Send it to a friend to open in a browser and join')); }
                 catch { message.error(tl('复制失败', 'Copy failed')); }
               }}

@@ -44,6 +44,7 @@ class SignalingClient {
     val connected: StateFlow<Boolean> = _connected
 
     fun connect(args: ConnectArgs) {
+        require(LobbyInviteCodec.isValidSignalingServer(args.url)) { "Signaling requires WSS" }
         val generation = synchronized(this) {
             connectionGeneration += 1
             connectArgs = args

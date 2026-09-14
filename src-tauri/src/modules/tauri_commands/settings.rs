@@ -1,4 +1,3 @@
-//! Application settings, avatar, volume, and configuration commands.
 use super::network::*;
 use super::shared::*;
 
@@ -28,7 +27,7 @@ use super::shared::*;
 pub async fn save_settings(
     language: Option<String>,
     auto_startup: bool,
-    auto_lobby_enabled: bool,
+    auto_lobby_enabled: Option<bool>,
     lobby_name: Option<String>,
     lobby_password: Option<String>,
     player_name: Option<String>,
@@ -57,7 +56,7 @@ pub async fn save_settings(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     use crate::modules::config_manager::{AutoLobbyConfig, EasyTierNode};
-    log::info!("保存设置: auto_startup={}, auto_lobby_enabled={}, use_private_server={}, always_on_top={:?}, remember_window_position={:?}, voice_volume={:?}, enable_gpu_rendering={:?}, mic_hotkey={:?}, global_mute_hotkey={:?}, push_to_talk_hotkey={:?}, enable_exit_node={:?}, subnet_proxy_cidrs={:?}, virtual_domain={:?}", 
+    log::info!("保存设置: auto_startup={}, auto_lobby_enabled={:?}, use_private_server={}, always_on_top={:?}, remember_window_position={:?}, voice_volume={:?}, enable_gpu_rendering={:?}, mic_hotkey={:?}, global_mute_hotkey={:?}, push_to_talk_hotkey={:?}, enable_exit_node={:?}, subnet_proxy_cidrs={:?}, virtual_domain={:?}",
         auto_startup, auto_lobby_enabled, use_private_server, always_on_top, remember_window_position, voice_volume, enable_gpu_rendering, mic_hotkey, global_mute_hotkey, push_to_talk_hotkey, enable_exit_node, subnet_proxy_cidrs, virtual_domain);
 
     let legacy_config_password = {
@@ -71,6 +70,7 @@ pub async fn save_settings(
             .and_then(|auto_lobby| auto_lobby.lobby_password.clone())
     };
     if let Some(password) = lobby_password.clone().or(legacy_config_password) {
+        let password = crate::modules::secret_store::resolve(&password)?;
         tokio::task::spawn_blocking(move || write_auto_lobby_secret(&password))
             .await
             .map_err(|error| format!("保存系统凭据任务失败: {}", error))??;
@@ -117,7 +117,7 @@ pub async fn save_settings(
                 );
 
                 config.auto_lobby = Some(AutoLobbyConfig {
-                    enabled: auto_lobby_enabled,
+                    enabled: auto_lobby_enabled.unwrap_or(existing.enabled),
                     lobby_name: lobby_name.clone().or(existing.lobby_name),
                     lobby_password: None,
                     player_name: player_name.clone().or(existing.player_name),
@@ -298,15 +298,14 @@ pub async fn get_settings(state: State<'_, AppState>) -> Result<serde_json::Valu
     let auto_lobby = config.auto_lobby.clone().unwrap_or_default();
     let mut lobby_password = tokio::task::spawn_blocking(read_auto_lobby_secret)
         .await
-        .map_err(|error| format!("读取系统凭据任务失败: {}", error))?;
+        .map_err(|error| format!("读取系统凭据任务失败: {}", error))??;
     if let Some(legacy_password) = auto_lobby.lobby_password.clone() {
         if lobby_password.is_none() {
-            let password = legacy_password.clone();
-            match tokio::task::spawn_blocking(move || write_auto_lobby_secret(&password)).await {
-                Ok(Ok(())) => lobby_password = Some(legacy_password),
-                Ok(Err(error)) => log::warn!("迁移自动大厅密码失败: {}", error),
-                Err(error) => log::warn!("迁移系统凭据任务失败: {}", error),
-            }
+            let password = crate::modules::secret_store::resolve(&legacy_password)?;
+            tokio::task::spawn_blocking(move || write_auto_lobby_secret(&password))
+                .await
+                .map_err(|_| "Cannot migrate lobby password")??;
+            lobby_password = Some(legacy_password);
         }
 
         let core = state.core.lock().await;
@@ -388,7 +387,7 @@ pub async fn get_settings(state: State<'_, AppState>) -> Result<serde_json::Valu
         "autoStartup": actual_auto_start,
         "autoLobbyEnabled": auto_lobby.enabled,
         "lobbyName": auto_lobby.lobby_name,
-        "lobbyPassword": lobby_password,
+        "lobbyPassword": lobby_password.map(crate::modules::secret_store::protect_lobby_password).transpose()?,
         "playerName": auto_lobby.player_name,
         "avatarData": config.avatar_data.clone(),
         "useDomain": auto_lobby.use_domain,

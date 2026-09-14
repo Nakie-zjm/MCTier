@@ -174,6 +174,7 @@ class NetworkController(private val context: Context) {
         }
         // —— flags：性能与出口节点开关 ——
         sb.append("\n[flags]\n")
+        sb.append("disable_encryption = false\nencryption_algorithm = \"aes-256-gcm\"\n")
         sb.append("latency_first = ").append(latencyFirst).append("\n")
         sb.append("mtu = ").append(mtu).append("\n")
         sb.append("multi_thread = ").append(multiThread).append("\n")

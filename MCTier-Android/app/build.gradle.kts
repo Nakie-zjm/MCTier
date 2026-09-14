@@ -17,8 +17,8 @@ android {
         applicationId = "top.pmh13.mctier"
         minSdk = 26
         targetSdk = 36
-        versionCode = 57
-        versionName = "3.3.0-android"
+        versionCode = 66
+        versionName = "3.4.0-android"
         ndk {
             // The bundled LocalVQE engine is currently built for the primary
             // Android ABI; unsupported ABIs retain the WebRTC hardware AEC/NS path.
@@ -96,7 +96,8 @@ val jvmSecurityHardeningTest by tasks.registering(JavaExec::class) {
     classpath = files(
         layout.buildDirectory.dir("tmp/kotlin-classes/debugUnitTest"),
         layout.buildDirectory.dir("tmp/kotlin-classes/debug"),
-        (configurations.findByName("testDebugRuntimeClasspath")
+        (configurations.findByName("debugUnitTestRuntimeClasspath")
+            ?: configurations.findByName("testDebugRuntimeClasspath")
             ?: configurations.findByName("testRuntimeClasspath")
             ?: configurations.getByName("debugRuntimeClasspath"))
             .files.filter { it.extension.equals("jar", ignoreCase = true) },
@@ -104,7 +105,7 @@ val jvmSecurityHardeningTest by tasks.registering(JavaExec::class) {
         fileTree("${gradle.gradleUserHomeDir}/caches/modules-2/files-2.1/org.hamcrest/hamcrest-core") { include("**/*.jar") },
     )
     mainClass.set("org.junit.runner.JUnitCore")
-    args("top.pmh13.mctier.network.SecurityHardeningTest", "top.pmh13.mctier.network.ChatOrderTest", "top.pmh13.mctier.network.ChatUnreadTest")
+    args("top.pmh13.mctier.network.SecurityHardeningTest", "top.pmh13.mctier.network.ChatOrderTest", "top.pmh13.mctier.network.ChatUnreadTest", "top.pmh13.mctier.network.EncryptedChatTest", "top.pmh13.mctier.network.ImageFormatTest", "top.pmh13.mctier.network.BuiltinEmojiCacheTest", "top.pmh13.mctier.network.EmojiManagementTest", "top.pmh13.mctier.network.ChatAttachmentTest", "top.pmh13.mctier.ui.ChatLinkTest")
 }
 tasks.withType<Test>().matching { it.name == "testDebugUnitTest" }.configureEach {
     dependsOn(syncDebugUnitTestKotlinClasses, jvmSecurityHardeningTest)
@@ -123,6 +124,7 @@ kotlin {
 
 dependencies {
     testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
     implementation(platform("androidx.compose:compose-bom:2025.05.01"))
     implementation("androidx.activity:activity-compose:1.10.1")
     // 保持 1.16.0：1.19.0 要求 AGP 9.1+ / compileSdk 37（Dependabot 误判为 minor 升级）
@@ -134,6 +136,8 @@ dependencies {
     implementation("androidx.compose.material:material-icons-extended")
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-tooling-preview")
+    implementation("io.coil-kt.coil3:coil-compose:3.3.0")
+    implementation("io.coil-kt.coil3:coil-gif:3.3.0")
     debugImplementation("androidx.compose.ui:ui-tooling")
 
     implementation("top.yukonga.miuix.kmp:miuix:0.8.8")
@@ -142,6 +146,8 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.11.0")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.11.0")
     implementation("org.nanohttpd:nanohttpd:2.3.1")
+    implementation("org.apache.poi:poi:5.4.1")
+    implementation("org.apache.poi:poi-scratchpad:5.4.1")
     implementation("io.github.webrtc-sdk:android:144.7559.14")
     // 二维码：生成(core) + 扫码(zxing-android-embedded)
     implementation("com.google.zxing:core:3.5.4")

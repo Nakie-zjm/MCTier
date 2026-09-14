@@ -4,11 +4,11 @@
 // 各玩家虚拟 IP 上是否开放了 Minecraft 服务器（默认端口 25565），
 // 并解析出 MOTD、版本、在线人数等信息，供前端展示"可加入的世界"。
 
+use super::virtual_network::virtual_host;
 use serde::Serialize;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use super::virtual_network::virtual_host;
 
 /// 发现的 Minecraft 服务器信息
 #[derive(Debug, Clone, Serialize)]
@@ -102,7 +102,9 @@ fn collect_text(v: &serde_json::Value, out: &mut String) {
 /// 查询单个 Minecraft 服务器（SLP），成功返回状态信息
 async fn query_server(ip: &str, port: u16) -> Option<DiscoveredServer> {
     let address = virtual_host(ip)?;
-    if port == 0 { return None; }
+    if port == 0 {
+        return None;
+    }
     let start = std::time::Instant::now();
 
     // 连接（带超时）
@@ -292,7 +294,11 @@ async fn measure_one(ip: &str) -> Option<u64> {
 #[tauri::command]
 pub async fn measure_peers_latency(peer_ips: Vec<String>) -> Vec<PeerLatency> {
     let mut tasks = Vec::new();
-    for ip in peer_ips.into_iter().filter(|ip| virtual_host(ip).is_some()).collect::<std::collections::BTreeSet<_>>() {
+    for ip in peer_ips
+        .into_iter()
+        .filter(|ip| virtual_host(ip).is_some())
+        .collect::<std::collections::BTreeSet<_>>()
+    {
         let ip_clone = ip.clone();
         tasks.push(tokio::spawn(async move {
             let probes = 2u32;

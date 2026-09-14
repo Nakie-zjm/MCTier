@@ -5,6 +5,9 @@ import android.content.Intent
 import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Build
+import android.provider.MediaStore
+import android.provider.OpenableColumns
+import android.content.ContentValues
 import android.util.Base64
 import android.util.Log
 import androidx.core.content.edit
@@ -22,9 +25,20 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import top.pmh13.mctier.data.AppConnectionState
 import top.pmh13.mctier.data.ChatMessage
+import top.pmh13.mctier.data.ChatImageMaxBytes
+import top.pmh13.mctier.data.CustomEmojiItem
+import top.pmh13.mctier.data.EmojiCategory
+import top.pmh13.mctier.data.imageExtension
+import top.pmh13.mctier.data.sniffChatImageMime
+import top.pmh13.mctier.data.removedCustomEmojiReferences
+import top.pmh13.mctier.data.updatedCustomEmojiItems
 import top.pmh13.mctier.data.ChatPeerIdentity
 import top.pmh13.mctier.data.ChatTokenHexLength
 import top.pmh13.mctier.data.ChatWireMessage
+import top.pmh13.mctier.data.ChatAttachmentMeta
+import top.pmh13.mctier.data.ChatMaxAttachmentBytes
+import top.pmh13.mctier.data.chatAttachmentMime
+import top.pmh13.mctier.data.validChatAttachment
 import top.pmh13.mctier.data.CommunityNodeAddressMaxLen
 import top.pmh13.mctier.data.CommunityNodeNameMaxLen
 import top.pmh13.mctier.data.AppClientVersion
@@ -43,6 +57,7 @@ import top.pmh13.mctier.data.SharedFolder
 import top.pmh13.mctier.data.SignalingEnvelope
 import top.pmh13.mctier.data.UserSettings
 import top.pmh13.mctier.network.AndroidRtcController
+import top.pmh13.mctier.network.BuiltinEmojiCache
 import top.pmh13.mctier.network.ChatAuth
 import top.pmh13.mctier.network.ChatP2PClient
 import top.pmh13.mctier.network.ConnectArgs
@@ -74,6 +89,17 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.UUID
 
 private const val MCTIER_DOWNLOAD_WEBSITE = "https://mctier.pmhs.top"
+
+private fun readLimited(input: java.io.InputStream, maximum: Int): ByteArray {
+    val output = ByteArrayOutputStream(minOf(maximum, 64 * 1024))
+    val buffer = ByteArray(8192)
+    while (output.size() <= maximum) {
+        val count = input.read(buffer, 0, minOf(buffer.size, maximum + 1 - output.size()))
+        if (count < 0) break
+        output.write(buffer, 0, count)
+    }
+    return output.toByteArray()
+}
 
 data class MctierUiState(
     val state: AppConnectionState = AppConnectionState.Idle,
@@ -129,6 +155,13 @@ data class MctierUiState(
     val remoteControlRequest: top.pmh13.mctier.data.RemoteControlRequest? = null, // 收到的待确认控制请求
     val remoteControlActiveBy: String? = null, // 正在被谁远程控制（控制端名字）
     val remoteControllingPeer: String? = null, // 本机正在远程控制的对方设备名（控制端视角）
+    val emojiCategories: List<EmojiCategory> = emptyList(),
+    val customEmojiItems: List<CustomEmojiItem> = emptyList(),
+    val recentEmojiIds: List<String> = emptyList(),
+    val emojiBuiltinSyncing: Boolean = false,
+    val emojiBuiltinError: String? = null,
+    val emojiBuiltinDownloaded: Int = 0,
+    val emojiBuiltinTotal: Int = 0,
 )
 
 enum class RecallChatResult { Success, Expired, Unavailable }
@@ -144,6 +177,9 @@ class MctierRepository(private val context: Context) {
         private const val LegacyAutoLobbyPasswordKey = "autoLobbyPassword"
         private const val LegacyFavoritesKey = "favorites"
         private const val LegacyRecentLobbiesKey = "recentLobbies"
+        private const val EmojiCategoriesKey = "emojiCategoriesV1"
+        private const val EmojiItemsKey = "emojiItemsV1"
+        private const val RecentEmojiKey = "recentEmojiV1"
 
         private fun normalizePlayerName(name: String): String =
             name.replace(Regex("\\s+"), "").take(MaxPlayerNameLength)
@@ -179,6 +215,9 @@ class MctierRepository(private val context: Context) {
     private val communityNodeClient = top.pmh13.mctier.network.CommunityNodeClient()
     private val updateChecker = UpdateChecker(context)
     private val soundManager = top.pmh13.mctier.network.SoundManager(context)
+    private val builtinEmojiCache = BuiltinEmojiCache(context)
+    private val cachedBuiltinEmojiItems = builtinEmojiCache.cachedItems()
+    private var builtinEmojiSyncJob: Job? = null
     private var reconnectNoticeJob: Job? = null
     private var lastShareSignalRequestAt: Long = 0L
     private val pendingPlayerLeaveJobs = mutableMapOf<String, Job>()
@@ -277,12 +316,16 @@ class MctierRepository(private val context: Context) {
             showOnboarding = !prefs.getBoolean("onboarded", false),
             customNodes = loadCustomNodes(),
             todos = loadTodos(),
+            emojiCategories = loadEmojiCategories(),
+            customEmojiItems = cachedBuiltinEmojiItems + loadEmojiItems(),
+            recentEmojiIds = loadRecentEmojiIds(),
         ),
     )
     val state: StateFlow<MctierUiState> = _state.asStateFlow()
 
     init {
         clearAvatarCacheOnStartup()
+        if (cachedBuiltinEmojiItems.isEmpty()) syncBuiltinEmoji()
         scope.launch { signalingClient.events.collect { handleSignal(it) } }
         // 应用已保存的音效/免打扰设置
         soundManager.applySettings(_state.value.settings)
@@ -503,8 +546,8 @@ class MctierRepository(private val context: Context) {
         signalingOverride: String? = null,
     ) {
         val safeLobbyName = lobbyName.trim()
-        val safePassword = password.trim()
-        if (!LobbyInviteCodec.isValidLobbyName(lobbyName) || !LobbyInviteCodec.isValidLobbyPassword(password)) {
+        val safePassword = LobbyInviteCodec.resolveLobbyPassword(password)?.trim()
+        if (safePassword == null || !LobbyInviteCodec.isValidLobbyName(safeLobbyName) || !LobbyInviteCodec.isValidLobbyPassword(safePassword)) {
             _state.update { it.copy(error = L("大厅名称或密码格式无效", "Invalid lobby name or password")) }
             return
         }
@@ -561,7 +604,7 @@ class MctierRepository(private val context: Context) {
                 )
                 fileServer = FileShareHttpServer(context, identityId, session.virtualIp).also { it.start(5_000, false) }
                 // 启动 P2P 聊天（与桌面端 14540 互通）
-                chatClient = ChatP2PClient(identityId, ioScope, session.virtualIp, { wire -> onIncomingChat(wire) }, signer)
+                chatClient = ChatP2PClient(identityId, ioScope, session.virtualIp, { wire -> onIncomingChat(wire) }, java.io.File(context.cacheDir, "chat-attachments"), signer)
                 screenController = ScreenShareController(appContext, identityId) { signalingClient.send(it) }.also { controller ->
                     val callbackGeneration = generation
                     controller.onViewingError = { shareId, error ->
@@ -855,6 +898,17 @@ class MctierRepository(private val context: Context) {
         _state.update { it.copy(chatMessages = orderedChatMessages(it.chatMessages + message)) }
     }
 
+    fun sendVoiceChat(bytes: ByteArray, duration: Double, recipientId: String?) {
+        val current = _state.value
+        val client = chatClient ?: return
+        ioScope.launch {
+            val wire = client.sendVoice(current.settings.playerName, bytes, duration, recipientId) ?: return@launch
+            val data = "data:audio/wav;base64," + Base64.encodeToString(bytes, Base64.NO_WRAP)
+            val message = ChatMessage(wire.id, current.playerId, current.settings.playerName, wire.content, wire.timestamp * 1000, mine = true, type = "voice", imageBase64 = data, recipientId = recipientId)
+            _state.update { it.copy(chatMessages = orderedChatMessages(it.chatMessages + message)) }
+        }
+    }
+
     fun recallChat(messageId: String, recipientId: String? = null): RecallChatResult {
         val current = _state.value
         val target = current.chatMessages.firstOrNull { it.id == messageId } ?: return RecallChatResult.Unavailable
@@ -876,24 +930,105 @@ class MctierRepository(private val context: Context) {
         }
     }
 
-    /** 发送图片消息（与桌面端互通，统一压成 JPEG 后以字节数组传输） */
+    /** 发送图片消息：保留 GIF/PNG/JPEG/WebP 原始字节，避免破坏动画。 */
     fun sendImageChat(uri: Uri, recipientId: String? = null) {
-        val current = _state.value
-        val client = chatClient ?: return
         ioScope.launch {
             runCatching {
-                val input = context.contentResolver.openInputStream(uri) ?: return@launch
-                val bitmap = input.use { BitmapFactory.decodeStream(it) } ?: return@launch
-                val baos = ByteArrayOutputStream()
-                bitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 70, baos)
-                val bytes = baos.toByteArray()
-                val intList = bytes.map { it.toInt() and 0xFF }
-                val wire = client.sendImage(current.settings.playerName, intList, recipientId) ?: return@runCatching
-                val base64 = "data:image/jpeg;base64," + Base64.encodeToString(bytes, Base64.NO_WRAP)
-                val message = ChatMessage(wire.id, current.playerId, current.settings.playerName, "[图片]", wire.timestamp * 1000, mine = true, type = "image", imageBase64 = base64, recipientId = recipientId)
-                _state.update { it.copy(chatMessages = orderedChatMessages(it.chatMessages + message)) }
+                val bytes = context.contentResolver.openInputStream(uri)?.use { readLimited(it, ChatImageMaxBytes) } ?: return@runCatching
+                sendImageBytes(bytes, recipientId)
             }
         }
+    }
+
+    fun sendFileChat(uri: Uri, recipientId: String? = null, onResult: (Boolean) -> Unit = {}) {
+        ioScope.launch {
+            val result = runCatching {
+                var displayName = "file-${System.currentTimeMillis()}"
+                var declaredSize = -1L
+                context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE), null, null, null)?.use { cursor ->
+                    if (cursor.moveToFirst()) {
+                        cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME).takeIf { it >= 0 }?.let { displayName = cursor.getString(it) ?: displayName }
+                        cursor.getColumnIndex(OpenableColumns.SIZE).takeIf { it >= 0 }?.let { declaredSize = cursor.getLong(it) }
+                    }
+                }
+                displayName = displayName.substringAfterLast('/').substringAfterLast('\\').take(180)
+                require(displayName.isNotBlank() && displayName.none { it.isISOControl() || it in "\\/:" })
+                require(declaredSize <= ChatMaxAttachmentBytes || declaredSize < 0)
+                val id = "att-${UUID.randomUUID()}"
+                val directory = java.io.File(context.cacheDir, "chat-attachments").also { it.mkdirs() }
+                val extension = displayName.substringAfterLast('.', "bin").takeIf { it.matches(Regex("[A-Za-z0-9]{1,16}")) } ?: "bin"
+                val target = java.io.File(directory, "$id.$extension")
+                var size = 0L
+                context.contentResolver.openInputStream(uri)?.use { input ->
+                    target.outputStream().use { output ->
+                        val buffer = ByteArray(16 * 1024)
+                        while (true) {
+                            val count = input.read(buffer)
+                            if (count < 0) break
+                            size += count
+                            require(size <= ChatMaxAttachmentBytes)
+                            output.write(buffer, 0, count)
+                        }
+                    }
+                } ?: error("无法读取文件")
+                require(size > 0 && (declaredSize < 0 || declaredSize == size))
+                val resolvedMime = context.contentResolver.getType(uri)?.takeIf { it.matches(Regex("[A-Za-z0-9.+-]+/[A-Za-z0-9.+-]+")) } ?: chatAttachmentMime(displayName)
+                val meta = ChatAttachmentMeta(id, displayName, resolvedMime, size)
+                require(validChatAttachment(meta))
+                val current = _state.value
+                val wire = chatClient?.sendFile(current.settings.playerName, meta, target, recipientId) ?: error("聊天未连接")
+                ChatMessage(wire.id, current.playerId, current.settings.playerName, wire.content, wire.timestamp * 1000, mine = true, type = "file", recipientId = recipientId, attachment = meta, attachmentPath = target.absolutePath)
+            }
+            result.onSuccess { message -> _state.update { it.copy(chatMessages = orderedChatMessages(it.chatMessages + message)) } }
+                .onFailure { Log.w(TAG, "发送文件失败: ${it.message}") }
+            withContext(Dispatchers.Main) { onResult(result.isSuccess) }
+        }
+    }
+
+    fun fetchChatAttachment(message: ChatMessage, onResult: (java.io.File?) -> Unit) {
+        val meta = message.attachment ?: run { onResult(null); return }
+        message.attachmentPath?.let { java.io.File(it).takeIf(java.io.File::isFile) }?.let { onResult(it); return }
+        ioScope.launch {
+            val file = chatClient?.fetchAttachment(message.playerId, meta)
+            if (file != null) _state.update { state -> state.copy(chatMessages = state.chatMessages.map { if (it.id == message.id) it.copy(attachmentPath = file.absolutePath) else it }) }
+            scope.launch { onResult(file) }
+        }
+    }
+
+    fun saveChatAttachment(message: ChatMessage, onResult: (Boolean) -> Unit) {
+        fetchChatAttachment(message) { source ->
+            if (source == null) { onResult(false); return@fetchChatAttachment }
+            ioScope.launch {
+                val ok = runCatching {
+                    val meta = message.attachment ?: error("附件元数据缺失")
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        val values = ContentValues().apply {
+                            put(MediaStore.Downloads.DISPLAY_NAME, meta.name)
+                            put(MediaStore.Downloads.MIME_TYPE, meta.mime)
+                            put(MediaStore.Downloads.RELATIVE_PATH, "Download/MCTier")
+                        }
+                        val uri = context.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: error("无法创建下载文件")
+                        context.contentResolver.openOutputStream(uri)?.use { output -> source.inputStream().use { it.copyTo(output) } } ?: error("无法写入下载文件")
+                    } else {
+                        val directory = context.getExternalFilesDir(android.os.Environment.DIRECTORY_DOWNLOADS) ?: context.filesDir
+                        source.copyTo(java.io.File(directory, meta.name), overwrite = true)
+                    }
+                }.isSuccess
+                scope.launch { onResult(ok) }
+            }
+        }
+    }
+
+    private fun sendImageBytes(bytes: ByteArray, recipientId: String? = null, content: String = "[图片]"): Boolean {
+        if (bytes.isEmpty() || bytes.size > ChatImageMaxBytes) return false
+        val mime = sniffChatImageMime(bytes) ?: return false
+        val current = _state.value
+        val client = chatClient ?: return false
+        val wire = client.sendImage(current.settings.playerName, bytes.map { it.toInt() and 0xFF }, recipientId, content) ?: return false
+        val base64 = "data:$mime;base64," + Base64.encodeToString(bytes, Base64.NO_WRAP)
+        val message = ChatMessage(wire.id, current.playerId, current.settings.playerName, content, wire.timestamp * 1000, mine = true, type = "image", imageBase64 = base64, recipientId = recipientId)
+        _state.update { it.copy(chatMessages = orderedChatMessages(it.chatMessages + message)) }
+        return true
     }
 
     /** 收到他人聊天消息（来自 P2P 聊天客户端，已去重并排除自己） */
@@ -948,8 +1083,13 @@ class MctierRepository(private val context: Context) {
         }
         val base64 = wire.imageData?.let { data ->
             val bytes = ByteArray(data.size) { i -> data[i].toByte() }
-            "data:image/jpeg;base64," + Base64.encodeToString(bytes, Base64.NO_WRAP)
+            val mime = if (wire.messageType == "voice") runCatching { org.json.JSONObject(wire.content).getString("mime") }.getOrDefault("audio/wav") else sniffChatImageMime(bytes) ?: return@let null
+            "data:$mime;base64," + Base64.encodeToString(bytes, Base64.NO_WRAP)
         }
+        val attachment = if (wire.messageType == "file") runCatching {
+            MctierJson.decodeFromString(ChatAttachmentMeta.serializer(), wire.content)
+        }.getOrNull()?.takeIf(::validChatAttachment) else null
+        if (wire.messageType == "file" && attachment == null) return
         // 桌面端发送时 player_name 可能为空（其前端按 player_id 在玩家列表里查名显示），
         // 这里同样在 playerName 为空时用 playerId 解析真实昵称，避免显示成"玩家"
         val resolvedName = wire.playerName.ifBlank {
@@ -965,6 +1105,7 @@ class MctierRepository(private val context: Context) {
             type = wire.messageType,
             imageBase64 = base64,
             recipientId = wire.recipientId,
+            attachment = attachment,
         )
         val finalMessage = if (pendingChatRecalls.remove(message.id) == message.playerId && System.currentTimeMillis() - message.timestamp <= RecallWindowMs) {
             message.copy(content = "", type = "text", imageBase64 = null, recalled = true)
@@ -988,7 +1129,7 @@ class MctierRepository(private val context: Context) {
                 if (wire.messageType == "image" && base64 != null) {
                     top.pmh13.mctier.ui.DanmakuOverlay.pushImage("$resolvedName:", base64)
                 } else {
-                    val visibleContent = wire.content.replaceFirst(Regex("^> \\[reply:[^]]+]\\s*"), "> ")
+                    val visibleContent = if (wire.messageType == "file") "[文件] ${attachment?.name.orEmpty()}" else wire.content.replaceFirst(Regex("^> \\[reply:[^]]+]\\s*"), "> ")
                     val dm = "$resolvedName: $visibleContent"
                     top.pmh13.mctier.ui.DanmakuOverlay.push(dm, copyText = visibleContent)
                 }
@@ -1163,11 +1304,12 @@ class MctierRepository(private val context: Context) {
             val ok = runCatching {
                 val raw = imageBase64.substringAfter("base64,", imageBase64)
                 val bytes = Base64.decode(raw, Base64.DEFAULT)
-                val name = "MCTier_${System.currentTimeMillis()}.jpg"
+                val mime = sniffChatImageMime(bytes) ?: return@runCatching false
+                val name = "MCTier_${System.currentTimeMillis()}.${imageExtension(mime)}"
                 if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
                     val values = android.content.ContentValues().apply {
                         put(android.provider.MediaStore.Images.Media.DISPLAY_NAME, name)
-                        put(android.provider.MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+                        put(android.provider.MediaStore.Images.Media.MIME_TYPE, mime)
                         put(android.provider.MediaStore.Images.Media.RELATIVE_PATH, "Pictures/MCTier")
                     }
                     val uri = context.contentResolver.insert(android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
@@ -1857,6 +1999,10 @@ class MctierRepository(private val context: Context) {
                     rejectChatProtocol(L("聊天成员身份无效", "Invalid chat member identity"))
                     return
                 }
+                // The initial avatar announcement can race the first roster.
+                // Re-announce after a peer is installed so desktop clients that
+                // joined just before this callback always receive the current avatar.
+                chatClient?.sendAvatar(_state.value.settings.avatarData)
                 if (id != _state.value.playerId) {
                     soundManager.playerJoin()
                     // 有新玩家加入时，把自己的文件共享列表推送给对方，确保对方能看到我的共享
@@ -2422,15 +2568,14 @@ class MctierRepository(private val context: Context) {
             return legacy
         }
         Log.w(TAG, "Secure preference migration failed")
-        securePrefs.remove(legacyKey)
+        // Preserve the original until Keystore is available for a retry.
         return null
     }
 
-    /** Never write a new credential in plaintext; discard legacy plaintext after migration. */
+    /** Never write plaintext or delete the last saved value on encryption failure. */
     private fun saveSecurePreference(secureKey: String, legacyKey: String, value: String) {
         if (!securePrefs.putStringRemoving(secureKey, value, legacyKey)) {
             Log.w(TAG, "Secure preference write failed")
-            securePrefs.remove(secureKey, legacyKey)
         }
     }
 
@@ -2639,6 +2784,207 @@ class MctierRepository(private val context: Context) {
 
     private fun saveTodos(list: List<TodoItem>) {
         prefs.edit { putString("todos", MctierJson.encodeToString(ListSerializer(TodoItem.serializer()), list)) }
+    }
+
+    private fun defaultEmojiCategories() = listOf(
+        EmojiCategory("recent", "最近", true),
+        EmojiCategory("builtin", "内置", true),
+        EmojiCategory("custom", "自定义", true),
+    )
+
+    private fun loadEmojiCategories(): List<EmojiCategory> {
+        val custom = runCatching {
+            prefs.getString(EmojiCategoriesKey, null)?.let { MctierJson.decodeFromString(ListSerializer(EmojiCategory.serializer()), it) }
+        }.getOrNull().orEmpty().filterNot { it.id in setOf("recent", "builtin", "custom") }
+        return defaultEmojiCategories() + custom
+    }
+
+    private fun loadEmojiItems(): List<CustomEmojiItem> = runCatching {
+        prefs.getString(EmojiItemsKey, null)?.let { MctierJson.decodeFromString(ListSerializer(CustomEmojiItem.serializer()), it) }
+    }.getOrNull().orEmpty().filter {
+        it.categoryId != "builtin" && java.io.File(context.filesDir, "emoji-library-v1/${it.fileName}").isFile
+    }
+
+    private fun loadRecentEmojiIds(): List<String> = runCatching {
+        prefs.getString(RecentEmojiKey, null)?.let { MctierJson.decodeFromString(ListSerializer(String.serializer()), it) }
+    }.getOrNull().orEmpty().take(32)
+
+    private fun saveEmojiState(categories: List<EmojiCategory> = _state.value.emojiCategories, items: List<CustomEmojiItem> = _state.value.customEmojiItems, recent: List<String> = _state.value.recentEmojiIds) {
+        prefs.edit {
+            putString(EmojiCategoriesKey, MctierJson.encodeToString(ListSerializer(EmojiCategory.serializer()), categories.filterNot { it.builtin }))
+            putString(EmojiItemsKey, MctierJson.encodeToString(ListSerializer(CustomEmojiItem.serializer()), items.filterNot { it.categoryId == "builtin" }))
+            putString(RecentEmojiKey, MctierJson.encodeToString(ListSerializer(String.serializer()), recent.take(32)))
+        }
+    }
+
+    fun createEmojiCategory(name: String): Boolean {
+        val clean = name.trim().take(20)
+        if (clean.isBlank() || _state.value.emojiCategories.any { it.name.equals(clean, true) }) return false
+        val categories = _state.value.emojiCategories + EmojiCategory("category-${UUID.randomUUID()}", clean)
+        _state.update { it.copy(emojiCategories = categories) }
+        saveEmojiState(categories = categories)
+        return true
+    }
+
+    fun renameEmojiCategory(id: String, name: String): Boolean {
+        val clean = name.trim().take(20)
+        val current = _state.value
+        if (clean.isBlank() || current.emojiCategories.none { it.id == id && !it.builtin } || current.emojiCategories.any { it.id != id && it.name.equals(clean, true) }) return false
+        val categories = current.emojiCategories.map { if (it.id == id) it.copy(name = clean) else it }
+        _state.update { it.copy(emojiCategories = categories) }
+        saveEmojiState(categories = categories)
+        return true
+    }
+
+    fun deleteEmojiCategory(id: String): Boolean {
+        val current = _state.value
+        if (current.emojiCategories.none { it.id == id && !it.builtin }) return false
+        val categories = current.emojiCategories.filterNot { it.id == id }
+        val items = current.customEmojiItems.map { if (it.categoryId == id) it.copy(categoryId = "custom") else it }
+        _state.update { it.copy(emojiCategories = categories, customEmojiItems = items) }
+        saveEmojiState(categories = categories, items = items)
+        return true
+    }
+
+    fun updateCustomEmoji(id: String, name: String, categoryId: String): Boolean {
+        val current = _state.value
+        val items = updatedCustomEmojiItems(current.customEmojiItems, current.emojiCategories, id, name, categoryId) ?: return false
+        _state.update { it.copy(customEmojiItems = items) }
+        saveEmojiState(items = items)
+        return true
+    }
+
+    fun deleteCustomEmoji(id: String): Boolean {
+        val current = _state.value
+        val target = current.customEmojiItems.firstOrNull { it.id == id && it.categoryId != "builtin" } ?: return false
+        val resourceRemoved = runCatching {
+            val root = java.io.File(context.filesDir, "emoji-library-v1").canonicalFile
+            val resource = java.io.File(root, target.fileName).canonicalFile
+            resource.parentFile == root && (!resource.exists() || resource.delete())
+        }.getOrDefault(false)
+        if (!resourceRemoved) return false
+        val result = removedCustomEmojiReferences(current.customEmojiItems, current.recentEmojiIds, id) ?: return false
+        _state.update { it.copy(customEmojiItems = result.items, recentEmojiIds = result.recentIds) }
+        saveEmojiState(items = result.items, recent = result.recentIds)
+        return true
+    }
+
+    fun importEmojiUris(uris: List<Uri>, categoryId: String = "custom", onResult: (Int, Int) -> Unit = { _, _ -> }) {
+        ioScope.launch {
+            val directory = java.io.File(context.filesDir, "emoji-library-v1").apply { mkdirs() }
+            val items = _state.value.customEmojiItems.toMutableList()
+            var customCount = items.count { it.categoryId != "builtin" }
+            var imported = 0
+            uris.forEach { uri ->
+                if (customCount >= 300) return@forEach
+                runCatching {
+                    val bytes = context.contentResolver.openInputStream(uri)?.use { input -> readLimited(input, 2 * 1024 * 1024) } ?: return@runCatching
+                    if (bytes.isEmpty() || bytes.size > 2 * 1024 * 1024) return@runCatching
+                    val mime = sniffChatImageMime(bytes) ?: return@runCatching
+                    val id = "emoji-${UUID.randomUUID()}"
+                    val fileName = "$id.${imageExtension(mime)}"
+                    java.io.File(directory, fileName).writeBytes(bytes)
+                    items += CustomEmojiItem(id, categoryId, fileName, mime, fileName, System.currentTimeMillis())
+                    customCount += 1
+                    imported += 1
+                }
+            }
+            val result = items.sortedByDescending { it.createdAt }
+            withContext(Dispatchers.Main) {
+                _state.update { it.copy(customEmojiItems = result) }
+                saveEmojiState(items = result)
+                onResult(imported, uris.size - imported)
+            }
+        }
+    }
+
+    fun addChatImageAsEmoji(imageData: String, categoryId: String = "custom", onResult: (Boolean) -> Unit = {}) {
+        ioScope.launch {
+            val added = runCatching {
+                val bytes = Base64.decode(imageData.substringAfter("base64,", imageData), Base64.DEFAULT)
+                if (bytes.isEmpty() || bytes.size > 2 * 1024 * 1024 || _state.value.customEmojiItems.count { it.categoryId != "builtin" } >= 300) return@runCatching false
+                val mime = sniffChatImageMime(bytes) ?: return@runCatching false
+                val id = "emoji-${UUID.randomUUID()}"
+                val fileName = "$id.${imageExtension(mime)}"
+                java.io.File(context.filesDir, "emoji-library-v1").apply { mkdirs() }.resolve(fileName).writeBytes(bytes)
+                val items = listOf(CustomEmojiItem(id, categoryId, fileName, mime, fileName, System.currentTimeMillis())) + _state.value.customEmojiItems
+                withContext(Dispatchers.Main) { _state.update { it.copy(customEmojiItems = items) }; saveEmojiState(items = items) }
+                true
+            }.getOrDefault(false)
+            withContext(Dispatchers.Main) { onResult(added) }
+        }
+    }
+
+    fun addChatAttachmentAsEmoji(message: ChatMessage, categoryId: String = "custom", onResult: (Boolean) -> Unit = {}) {
+        val meta = message.attachment ?: run { onResult(false); return }
+        if (top.pmh13.mctier.data.chatAttachmentKind(meta) != "image") { onResult(false); return }
+        fetchChatAttachment(message) { file ->
+            if (file == null) { onResult(false); return@fetchChatAttachment }
+            ioScope.launch {
+                val added = runCatching {
+                    val bytes = file.inputStream().use { readLimited(it, ChatImageMaxBytes) }
+                    if (bytes.isEmpty() || bytes.size > ChatImageMaxBytes || _state.value.customEmojiItems.count { it.categoryId != "builtin" } >= 300) return@runCatching false
+                    val mime = sniffChatImageMime(bytes) ?: return@runCatching false
+                    val id = "emoji-${UUID.randomUUID()}"
+                    val fileName = "$id.${imageExtension(mime)}"
+                    java.io.File(context.filesDir, "emoji-library-v1").apply { mkdirs() }.resolve(fileName).writeBytes(bytes)
+                    val items = listOf(CustomEmojiItem(id, categoryId, meta.name.take(80), mime, fileName, System.currentTimeMillis())) + _state.value.customEmojiItems
+                    withContext(Dispatchers.Main) { _state.update { it.copy(customEmojiItems = items) }; saveEmojiState(items = items) }
+                    true
+                }.getOrDefault(false)
+                withContext(Dispatchers.Main) { onResult(added) }
+            }
+        }
+    }
+
+    fun sendEmoji(item: CustomEmojiItem, recipientId: String? = null, onResult: (Boolean) -> Unit = {}) {
+        ioScope.launch {
+            val bytes = runCatching { java.io.File(context.filesDir, "emoji-library-v1/${item.fileName}").readBytes() }.getOrNull()
+            if (bytes == null || !sendImageBytes(bytes, recipientId, "[表情]")) {
+                withContext(Dispatchers.Main) { onResult(false) }
+                return@launch
+            }
+            val recent = listOf(item.id) + _state.value.recentEmojiIds.filterNot { it == item.id }
+            withContext(Dispatchers.Main) {
+                _state.update { it.copy(recentEmojiIds = recent.take(32)) }
+                saveEmojiState(recent = recent)
+                onResult(true)
+            }
+        }
+    }
+
+    fun retryBuiltinEmojiSync() = syncBuiltinEmoji()
+
+    private fun syncBuiltinEmoji() {
+        if (builtinEmojiSyncJob?.isActive == true) return
+        _state.update { it.copy(emojiBuiltinSyncing = true, emojiBuiltinError = null, emojiBuiltinDownloaded = 0, emojiBuiltinTotal = 0) }
+        builtinEmojiSyncJob = ioScope.launch {
+            runCatching { builtinEmojiCache.sync { downloaded, total ->
+                _state.update { it.copy(emojiBuiltinDownloaded = downloaded, emojiBuiltinTotal = total) }
+            } }
+                .onSuccess { builtin ->
+                    withContext(Dispatchers.Main) {
+                        _state.update { current ->
+                            current.copy(
+                                customEmojiItems = builtin + current.customEmojiItems.filterNot { it.categoryId == "builtin" },
+                                emojiBuiltinSyncing = false,
+                                emojiBuiltinError = null,
+                            )
+                        }
+                    }
+                }
+                .onFailure { error ->
+                    Log.w(TAG, "Built-in emoji synchronization failed", error)
+                    withContext(Dispatchers.Main) {
+                        _state.update {
+                            it.copy(
+                                emojiBuiltinSyncing = false,
+                                emojiBuiltinError = error.message ?: "download failed",
+                            )
+                        }
+                    }
+                }
+        }
     }
 
     private fun defaultDevicePlayerName(): String {

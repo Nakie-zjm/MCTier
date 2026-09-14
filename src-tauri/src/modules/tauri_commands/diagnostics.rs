@@ -1,4 +1,3 @@
-//! Node latency, security-software detection, and diagnostics commands.
 use super::shared::*;
 use super::{network::*, remote_files::*};
 

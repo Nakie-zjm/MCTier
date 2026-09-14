@@ -1,4 +1,3 @@
-//! Application log access commands.
 use super::shared::*;
 
 /// 打开日志文件所在的文件夹

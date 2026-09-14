@@ -287,17 +287,9 @@ impl NetworkService {
         }
 
         // ========== 加密和安全 ==========
-        if config.disable_encryption {
-            cmd.arg("--disable-encryption");
-            log::info!("  ✅ 禁用加密");
-        }
-
-        if let Some(ref algo) = config.encryption_algorithm {
-            if !algo.is_empty() {
-                cmd.arg("--encryption-algorithm").arg(algo);
-                log::info!("  ✅ 加密算法: {}", algo);
-            }
-        }
+        // All application traffic (including media and private messages) uses
+        // the overlay. Never allow a saved legacy setting to disable encryption.
+        cmd.arg("--encryption-algorithm").arg("aes-256-gcm");
 
         // ========== 网络设备 ==========
         if config.bind_device {
@@ -1593,7 +1585,7 @@ impl NetworkService {
             // 排除包含 local_addr 的传输端点行。静态模式的 `ipv4 =
             // "10.126.126.1/24"` 是 EasyTier 唯一会输出的本机地址来源，
             // 不能再把它当成普通配置噪声丢弃，否则启动会错误等待 60 秒超时。
-            let is_excluded = line.contains("local_addr") 
+            let is_excluded = line.contains("local_addr")
                 || line.contains("local:")
                 || line.contains("listeners")
                 || line.contains("rpc_portal =");

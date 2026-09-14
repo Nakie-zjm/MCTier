@@ -1,4 +1,3 @@
-//! Safe local file and ZIP archive commands.
 #[cfg(test)]
 use super::file_share::validate_download_file_name;
 use super::shared::*;
@@ -7,7 +6,9 @@ use super::shared::*;
 
 // ZIP extraction helpers keep every output path inside the selected directory.
 pub(crate) const MAX_ZIP_ENTRIES: usize = 4096;
+
 pub(crate) const MAX_ZIP_ENTRY_UNCOMPRESSED_BYTES: u64 = 512 * 1024 * 1024;
+
 pub(crate) const MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Normalize a ZIP entry using Windows path rules on every platform. Archives
@@ -669,10 +670,26 @@ pub async fn save_chat_image(image_data: String) -> Result<String, String> {
 
     log::info!("保存聊天图片，数据长度: {} bytes", image_data.len());
 
-    // 解码Base64数据
+    if image_data.len() > 14 * 1024 * 1024 {
+        return Err("图片大小超出限制".to_string());
+    }
     let bytes = general_purpose::STANDARD
         .decode(&image_data)
         .map_err(|e| format!("Base64解码失败: {}", e))?;
+    if bytes.is_empty() || bytes.len() > 10 * 1024 * 1024 {
+        return Err("图片大小超出限制".to_string());
+    }
+    let extension = if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        "gif"
+    } else if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]) {
+        "png"
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        "jpg"
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        "webp"
+    } else {
+        return Err("不支持的图片格式".to_string());
+    };
 
     log::info!("解码后图片大小: {} bytes", bytes.len());
 
@@ -684,7 +701,7 @@ pub async fn save_chat_image(image_data: String) -> Result<String, String> {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis();
-    let filename = format!("MCTier_聊天图片_{}.png", timestamp);
+    let filename = format!("MCTier_聊天图片_{}.{}", timestamp, extension);
 
     // 构建完整路径
     let file_path = download_dir.join(filename);

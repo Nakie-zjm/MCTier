@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { ConfigProvider, theme, App as AntdApp, Button, Modal } from 'antd';
+import { FeedbackHost } from './components/FeedbackHost/FeedbackHost';
 import zhCN from 'antd/locale/zh_CN';
 import enUS from 'antd/locale/en_US';
 import { invoke } from '@tauri-apps/api/core';
@@ -343,6 +344,12 @@ function MainWindowApp() {
   // 开发调试用快捷键：Shift+F1 打开日志文件（内部使用，不对外暴露、不提供自定义）
   useEffect(() => {
     const handleKeyDown = async (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'f') {
+        e.preventDefault();
+        e.stopPropagation();
+        window.dispatchEvent(new Event('mctier-open-chat-search'));
+        return;
+      }
       if (!(e.shiftKey && e.key === 'F1')) return;
       e.preventDefault();
       try {
@@ -352,9 +359,9 @@ function MainWindowApp() {
       }
     };
 
-    document.addEventListener('keydown', handleKeyDown);
+    document.addEventListener('keydown', handleKeyDown, true);
     return () => {
-      document.removeEventListener('keydown', handleKeyDown);
+      document.removeEventListener('keydown', handleKeyDown, true);
     };
   }, []);
 
@@ -815,6 +822,7 @@ function MainWindowApp() {
         }}
       >
         <AntdApp>
+          <FeedbackHost />
           <GlobalTooltip />
           <GlobalButtonTheme />
           <div className="app-container">

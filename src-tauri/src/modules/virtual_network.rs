@@ -2,7 +2,9 @@ use std::net::Ipv4Addr;
 
 /// std creates non-inheritable sockets on Windows. The current mio bind path
 /// does not, so children such as the log viewer can otherwise keep ports alive.
-pub fn bind_service_listener(address: std::net::SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
+pub fn bind_service_listener(
+    address: std::net::SocketAddr,
+) -> std::io::Result<tokio::net::TcpListener> {
     let listener = std::net::TcpListener::bind(address)?;
     listener.set_nonblocking(true)?;
     tokio::net::TcpListener::from_std(listener)
@@ -31,7 +33,9 @@ mod tests {
             GetHandleInformation(HANDLE(listener.as_raw_socket() as *mut _), &mut flags).unwrap();
         }
         assert_eq!(flags & HANDLE_FLAG_INHERIT.0, 0);
-        let connection = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let connection = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
         let (accepted, _) = listener.accept().await.unwrap();
         unsafe {
             GetHandleInformation(HANDLE(accepted.as_raw_socket() as *mut _), &mut flags).unwrap();

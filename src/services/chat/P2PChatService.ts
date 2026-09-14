@@ -32,6 +32,9 @@ interface BackendChatMessage {
   image_data?: number[]; // Uint8Array转换为number[]
   recipient_id?: string | null;
 }
+import { MAX_VOICE_BYTES, voiceMetadata, voiceDataUrl } from './voiceMessage';
+import { bytesToImageDataUrl } from './imageData';
+import { parseChatAttachment, type ChatAttachment } from './fileAttachment';
 
 // 本机聊天服务器端口（服务器现在仅绑定在虚拟网卡 IP 上，不再监听 0.0.0.0，
 // 因此自订阅也必须连接到本机的虚拟 IP，而不是 127.0.0.1）
@@ -285,9 +288,12 @@ class P2PChatService {
 
     if (!messageId || !playerId || !Number.isFinite(timestamp) || timestamp < 0) return;
     if (msg.recipient_id && msg.recipient_id !== this.currentPlayerId) return;
-    if (!['text', 'image', 'announce', 'voicegroup', 'todo', 'recall', 'avatar'].includes(messageType)) return;
+    if (!['text', 'image', 'voice', 'file', 'announce', 'voicegroup', 'todo', 'recall', 'avatar'].includes(messageType)) return;
+    if (messageType === 'voice' && (!voiceMetadata(content) || !Array.isArray(msg.image_data) || msg.image_data.length === 0 || msg.image_data.length > MAX_VOICE_BYTES || !msg.image_data.every(b => Number.isInteger(b) && b >= 0 && b <= 255))) return;
     if (messageType !== 'announce' && messageType !== 'voicegroup' && messageType !== 'todo' && messageType !== 'recall' && messageType !== 'avatar' && !playerName) return;
     if (messageType === 'image' && !this.isSafeImageBytes(msg.image_data)) return;
+    const attachment = messageType === 'file' ? parseChatAttachment(content) : null;
+    if (messageType === 'file' && (!attachment || msg.image_data != null)) return;
 
     const safeMessage: BackendChatMessage = {
       ...msg,
@@ -297,7 +303,7 @@ class P2PChatService {
       content,
       message_type: messageType,
       timestamp,
-      image_data: messageType === 'image' ? msg.image_data : undefined,
+      image_data: messageType === 'image' || messageType === 'voice' ? msg.image_data : undefined,
     };
 
     // 控制消息（公告 / 语音小队 / 待办）：不计入聊天，分发到状态后返回
@@ -354,12 +360,14 @@ class P2PChatService {
       content: safeMessage.content,
       timestamp: safeMessage.timestamp * 1000, // 转换为毫秒
       ...(safeMessage.recipient_id ? { recipientId: safeMessage.recipient_id } : {}),
-      type: safeMessage.message_type === 'image' ? 'image' : 'text',
-      imageData: safeMessage.image_data ? this.arrayToBase64(safeMessage.image_data) : undefined,
+      type: messageType === 'voice' ? 'voice' : safeMessage.message_type === 'image' ? 'image' : messageType === 'file' ? 'file' : 'text',
+      imageData: messageType === 'voice' ? voiceDataUrl(safeMessage.image_data!, voiceMetadata(content)!.mime) : safeMessage.image_data ? bytesToImageDataUrl(new Uint8Array(safeMessage.image_data)) : undefined,
+      attachment: attachment ?? undefined,
     };
     if (this.pendingRecalls.get(safeMessage.id) === safeMessage.player_id && isWithinRecallWindow(chatMessage.timestamp)) {
       chatMessage.content = '';
       chatMessage.imageData = undefined;
+      chatMessage.attachment = undefined;
       chatMessage.type = 'text';
       chatMessage.recalled = true;
       this.pendingRecalls.delete(safeMessage.id);
@@ -525,6 +533,25 @@ class P2PChatService {
     }
   }
 
+  async sendVoiceMessage(blob: Blob, duration: number, messageId: string, recipientId?: string) {
+    return invoke<{ delivered: number; total: number }>('send_p2p_chat_message', {
+      playerId: this.currentPlayerId, playerName: '', messageType: 'voice',
+      content: JSON.stringify({ mime: blob.type, duration }),
+      imageData: Array.from(new Uint8Array(await blob.arrayBuffer())),
+      messageId, recipientId: recipientId || null, peerIps: this.peerIps,
+    });
+  }
+
+  async sendFileMessage(attachment: ChatAttachment, messageId: string, recipientId?: string) {
+    const safe = parseChatAttachment(attachment);
+    if (!this.currentPlayerId || !safe) throw new Error('文件附件元数据无效');
+    return invoke<{ delivered: number; total: number }>('send_p2p_chat_message', {
+      playerId: this.currentPlayerId, playerName: '', messageType: 'file',
+      content: JSON.stringify(safe), imageData: null, messageId,
+      recipientId: recipientId || null, peerIps: this.peerIps,
+    });
+  }
+
   /**
    * 发送图片消息（Base64格式）
    * 【优化】使用更高效的数据转换方式
@@ -611,24 +638,6 @@ class P2PChatService {
     }
   }
 
-  /**
-   * 将number数组转换为Base64 Data URL
-   * 【优化】直接使用JPEG格式，因为前端已经统一转换为JPEG
-   */
-  private arrayToBase64(data: number[]): string {
-    const bytes = new Uint8Array(data);
-    let binary = '';
-    const chunkSize = 8192; // 分块处理，提高性能
-    
-    for (let i = 0; i < bytes.length; i += chunkSize) {
-      const chunk = bytes.subarray(i, Math.min(i + chunkSize, bytes.length));
-      binary += String.fromCharCode.apply(null, Array.from(chunk));
-    }
-    
-    const base64 = btoa(binary);
-    // 前端已统一转换为JPEG格式
-    return `data:image/jpeg;base64,${base64}`;
-  }
 }
 
 export const p2pChatService = new P2PChatService();

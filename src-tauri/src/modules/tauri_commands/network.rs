@@ -1,4 +1,3 @@
-//! Signaling, network diagnostics, firewall, and auto-start commands.
 use super::shared::*;
 
 // ==================== WebRTC 语音通信命令 ====================
@@ -398,6 +397,7 @@ pub async fn restart_as_admin(app_handle: tauri::AppHandle) -> Result<(), String
         Err("当前平台不支持".to_string())
     }
 }
+
 ///
 /// # 参数
 /// * `ip` - 要 ping 的 IP 地址
