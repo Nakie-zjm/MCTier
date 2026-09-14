@@ -9,7 +9,8 @@ const serviceSource = fs.readFileSync(sourceFile, 'utf8');
 const androidRepository = fs.readFileSync(new URL('../MCTier-Android/app/src/main/java/top/pmh13/mctier/MctierRepository.kt', import.meta.url), 'utf8');
 let moduleVersion = 0;
 
-async function loadService(websocket) {
+async function loadService(websocket, invoke = async () => undefined) {
+  globalThis.__remoteControlTestInvoke = invoke;
   const result = await build({
     stdin: {
       contents: `export * from ${JSON.stringify(sourceFile)}; export * from ${JSON.stringify(fileURLToPath(new URL('../src/services/signaling/registeredSocket.ts', import.meta.url)))};`,
@@ -25,7 +26,7 @@ async function loadService(websocket) {
       setup(pluginBuild) {
         pluginBuild.onResolve({ filter: /^@tauri-apps\/api\/core$/ }, () => ({ path: 'tauri-core', namespace: 'stub' }));
         pluginBuild.onLoad({ filter: /.*/, namespace: 'stub' }, () => ({
-          contents: 'export const invoke = async () => undefined;',
+          contents: 'export const invoke = (...args) => globalThis.__remoteControlTestInvoke(...args);',
           loader: 'js',
         }));
       },
@@ -155,6 +156,32 @@ test('pending request stop invalidates delayed accept', async () => {
   );
   assert.equal(remoteControlService.getRole(), 'idle');
   assert.equal(mocks.sent.length, 0);
+});
+
+test('ending control while native authorization is pending cannot send a stale acceptance', async () => {
+  const mocks = installBrowserMocks();
+  const calls = [];
+  let finishAuthorization;
+  const { remoteControlService } = await loadService(mocks.websocket, (command, args) => {
+    calls.push({ command, args });
+    if (command === 'authorize_remote_input') {
+      return new Promise((resolve) => { finishAuthorization = resolve; });
+    }
+    return Promise.resolve();
+  });
+  remoteControlService.initialize('local', 'Local', mocks.websocket);
+  remoteControlService.handleRequest('sid-old', 'controller', 'Controller', 'local');
+  const accepting = remoteControlService.acceptControl('sid-old', 'controller', 'Controller');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(typeof finishAuthorization, 'function');
+  remoteControlService.stopControl(false);
+  const callsBeforeCompletion = calls.length;
+  finishAuthorization();
+  await accepting;
+  assert.equal(remoteControlService.getRole(), 'idle');
+  assert.equal(mocks.sent.some((message) => message.type === 'remote-control-accept'), false);
+  assert.ok(calls.slice(callsBeforeCompletion).some(({ command, args }) =>
+    command === 'revoke_remote_input' && args.sessionId === 'sid-old'));
 });
 
 test('old PC callbacks cannot stop or signal a second session', async () => {

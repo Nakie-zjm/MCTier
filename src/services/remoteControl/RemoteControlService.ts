@@ -178,6 +178,11 @@ class RemoteControlService {
         };
       }
       await invoke('authorize_remote_input', { sessionId, controllerId });
+      // Authorization may finish after stop/leave or after another session starts.
+      if (!this.isCurrentPeerMessage(sessionId, controllerId, this.playerId) || this.localStream !== stream) {
+        await invoke('revoke_remote_input', { sessionId, controllerId }).catch(() => {});
+        return;
+      }
       this.send({
         type: 'remote-control-accept',
         from: this.playerId,
