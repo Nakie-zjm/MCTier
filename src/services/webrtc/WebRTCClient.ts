@@ -25,8 +25,6 @@ import {
   isSafeChatPublicKey,
   isSafeChatToken,
   isSafeIdentifier,
-  isSafeResourceId,
-  isSafeSessionId,
   isSafeServerNode,
   isSafeSignalingServer,
   isSafeVirtualDomain,
@@ -38,6 +36,18 @@ import {
   sanitizeIdentifier,
   sanitizeUntrustedText,
 } from '../../security/trustBoundary';
+import {
+  authenticatePeerMessage,
+  authenticateSessionMessage,
+  CLIENT_ID_PATTERN,
+  isValidIceCandidate,
+  isValidSessionDescription,
+  parseResourceId,
+  parseRouteVersion,
+  parseSessionGeneration,
+  parseViewerCount,
+  validateOutboundSignalingMessage,
+} from './signalingTrustBoundary';
 
 export interface SignalingMessage {
   type:
@@ -82,43 +92,6 @@ const MAX_SIGNALING_FRAME_BYTES = 256 * 1024;
 const MAX_ICE_CANDIDATES_PER_PEER = 64;
 const MAX_ICE_BYTES_PER_PEER = 256 * 1024;
 const ICE_CANDIDATE_TTL_MS = 30_000;
-const SESSION_GENERATION_PATTERN = /^[a-f0-9]{16,64}$/;
-const CLIENT_ID_PATTERN = /^[a-f0-9]{64}$/;
-const OUTBOUND_SIGNALING_TYPES = new Set([
-  'players-list-request',
-  'offer',
-  'answer',
-  'ice-candidate',
-  'voice-reconnect',
-  'status-update',
-  'chat-message',
-  'screen-share-list-request',
-  'screen-share-list-response',
-  'screen-share-start',
-  'screen-share-stop',
-  'screen-share-offer',
-  'screen-share-answer',
-  'screen-share-ice-candidate',
-  'screen-share-error',
-  'screen-share-relay',
-  'screen-share-update',
-  'screen-share-viewer-left',
-  'file-share-list-request',
-  'file-share-list-response',
-  'file-share-added',
-  'file-share-removed',
-  'remote-control-request',
-  'remote-control-accept',
-  'remote-control-reject',
-  'remote-control-offer',
-  'remote-control-answer',
-  'remote-control-ice',
-  'remote-control-stop',
-  'kick-player',
-  'mute-player',
-  'transfer-host',
-  'set-lobby-options',
-]);
 
 interface ChatPeerPayload {
   player_id: string;
@@ -979,8 +952,7 @@ export class WebRTCClient {
   }
 
   private safeSessionGeneration(value: unknown): string | null {
-    if (typeof value === 'number' && Number.isSafeInteger(value) && value > 0) return String(value);
-    return typeof value === 'string' && SESSION_GENERATION_PATTERN.test(value) ? value : null;
+    return parseSessionGeneration(value);
   }
 
   private derivedVirtualDomain(playerId: string, value: unknown): string | undefined {
@@ -990,86 +962,50 @@ export class WebRTCClient {
   }
 
   private authenticatedPeerId(message: unknown, requireTarget = true): string | null {
-    if (!message || typeof message !== 'object') return null;
-    const input = message as Record<string, unknown>;
-    const from = input.from;
-    const to = input.to;
-    if (!isSafeIdentifier(from) || from === this.localPlayerId || !this.knownPlayers.has(from)) {
-      return null;
-    }
-    const expectedGeneration = this.peerSessionGenerations.get(from);
-    const messageGeneration = this.safeSessionGeneration(input.sessionGeneration);
-    if (!expectedGeneration || messageGeneration !== expectedGeneration) return null;
-    if (requireTarget && to !== this.localPlayerId) return null;
-    if (!requireTarget && input.to !== undefined && to !== this.localPlayerId) {
-      return null;
-    }
-    return from;
+    return authenticatePeerMessage(
+      message,
+      {
+        localPlayerId: this.localPlayerId,
+        knownPlayers: this.knownPlayers,
+        peerSessionGenerations: this.peerSessionGenerations,
+      },
+      requireTarget,
+    );
   }
 
   private safeRouteVersion(value: unknown): number | undefined {
-    if (value === undefined || value === null) return undefined;
-    return typeof value === 'number' &&
-      Number.isSafeInteger(value) &&
-      value > 0 &&
-      value <= 1_000_000_000
-      ? value
-      : undefined;
+    return parseRouteVersion(value);
   }
 
   private safeViewerCount(value: unknown): number {
-    return typeof value === 'number' && Number.isSafeInteger(value)
-      ? Math.max(0, Math.min(100_000, value))
-      : 0;
+    return parseViewerCount(value);
   }
 
   private safeScreenShareId(value: unknown): string | null {
-    return isSafeResourceId(value) ? value : null;
+    return parseResourceId(value);
   }
 
   private safeFileShareId(value: unknown): string | null {
-    return isSafeResourceId(value) ? value : null;
+    return parseResourceId(value);
   }
 
   private authenticatedSession(message: unknown): { peerId: string; sessionId: string } | null {
-    const peerId = this.authenticatedPeerId(message);
-    if (!peerId || !message || typeof message !== 'object') return null;
-    const sessionId = (message as Record<string, unknown>).sessionId;
-    return isSafeSessionId(sessionId) ? { peerId, sessionId } : null;
+    return authenticateSessionMessage(message, {
+      localPlayerId: this.localPlayerId,
+      knownPlayers: this.knownPlayers,
+      peerSessionGenerations: this.peerSessionGenerations,
+    });
   }
 
   private isSafeSessionDescription(
     value: unknown,
     expectedType: 'offer' | 'answer'
   ): value is RTCSessionDescriptionInit {
-    if (!value || typeof value !== 'object') return false;
-    const input = value as Record<string, unknown>;
-    return (
-      input.type === expectedType &&
-      typeof input.sdp === 'string' &&
-      input.sdp.length > 0 &&
-      input.sdp.length <= 128 * 1024
-    );
+    return isValidSessionDescription(value, expectedType);
   }
 
   private isSafeIceCandidate(value: unknown): boolean {
-    if (!value || typeof value !== 'object') return false;
-    const input = value as Record<string, unknown>;
-    if (
-      typeof input.candidate !== 'string' ||
-      input.candidate.length === 0 ||
-      input.candidate.length > 16 * 1024
-    )
-      return false;
-    if (
-      input.sdpMLineIndex != null &&
-      (typeof input.sdpMLineIndex !== 'number' ||
-        !Number.isSafeInteger(input.sdpMLineIndex) ||
-        input.sdpMLineIndex < 0 ||
-        input.sdpMLineIndex > 256)
-    )
-      return false;
-    return input.sdpMid == null || (typeof input.sdpMid === 'string' && input.sdpMid.length <= 128);
+    return isValidIceCandidate(value);
   }
 
   private parseChatPeer(raw: unknown): ChatPeerPayload | null {
@@ -2984,35 +2920,25 @@ export class WebRTCClient {
    */
   public sendWebSocketMessage(message: any): boolean {
     if (!isSignalingSocketRegistered(this.websocket)) return false;
-    if (!message || typeof message !== 'object' || Array.isArray(message)) {
+    const validation = validateOutboundSignalingMessage(message, {
+      localPlayerId: this.localPlayerId,
+      knownPlayers: this.knownPlayers,
+      serverSessionGeneration: this.serverSessionGeneration,
+    });
+    if (!validation.ok) {
+      const warnings: Record<string, string> = {
+        'unknown-type': '⚠️ 拒绝发送未声明的信令消息类型',
+        'forged-sender': '⚠️ 拒绝发送伪造发送者身份的信令消息',
+        'unknown-target': '⚠️ 拒绝发送给未知信令目标',
+        'forged-client': '⚠️ 拒绝发送伪造客户端身份的状态消息',
+        'forged-player': '⚠️ 拒绝发送伪造玩家身份的聊天消息',
+        oversized: '⚠️ 拒绝发送过大的信令消息',
+      };
+      const warning = warnings[validation.reason];
+      if (warning) console.warn(warning);
       return false;
     }
-    const messageType = message.type;
-    if (!isSafeIdentifier(messageType, 64) || !OUTBOUND_SIGNALING_TYPES.has(messageType)) {
-      console.warn('⚠️ 拒绝发送未声明的信令消息类型');
-      return false;
-    }
-    if (message.from !== undefined && message.from !== this.localPlayerId) {
-      console.warn('⚠️ 拒绝发送伪造发送者身份的信令消息');
-      return false;
-    }
-    if (
-      message.to !== undefined &&
-      (!isSafeIdentifier(message.to) ||
-        message.to === this.localPlayerId ||
-        !this.knownPlayers.has(message.to))
-    ) {
-      console.warn('⚠️ 拒绝发送给未知信令目标');
-      return false;
-    }
-    if (messageType === 'status-update' && message.clientId !== this.localPlayerId) {
-      console.warn('⚠️ 拒绝发送伪造客户端身份的状态消息');
-      return false;
-    }
-    if (messageType === 'chat-message' && message.playerId !== this.localPlayerId) {
-      console.warn('⚠️ 拒绝发送伪造玩家身份的聊天消息');
-      return false;
-    }
+    const { messageType, serialized } = validation;
 
     if (!this.websocket) {
       console.error('❌ WebSocket实例不存在，无法发送消息:', messageType);
@@ -3021,28 +2947,6 @@ export class WebRTCClient {
 
     if (this.websocket.readyState === WebSocket.OPEN) {
       try {
-        const outbound = this.serverSessionGeneration
-          ? { ...message, sessionGeneration: this.serverSessionGeneration }
-          : message;
-        const serialized = JSON.stringify(outbound);
-        const isSdp = [
-          'offer',
-          'answer',
-          'screen-share-offer',
-          'screen-share-answer',
-          'remote-control-offer',
-          'remote-control-answer',
-        ].includes(messageType);
-        const isIce = [
-          'ice-candidate',
-          'screen-share-ice-candidate',
-          'remote-control-ice',
-        ].includes(messageType);
-        const maxBytes = isSdp ? 128 * 1024 : isIce ? 16 * 1024 : 64 * 1024;
-        if (serialized.length > maxBytes) {
-          console.warn('⚠️ 拒绝发送过大的信令消息');
-          return false;
-        }
         this.websocket.send(serialized);
         return true;
       } catch (error) {
