@@ -32,4 +32,3 @@ export async function fileToChatImageDataUrl(file: Blob): Promise<string> {
   if (!mime) throw new Error('IMAGE_FORMAT');
   return bytesToImageDataUrl(bytes, mime);
 }
-
