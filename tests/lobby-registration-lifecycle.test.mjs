@@ -6,7 +6,7 @@ import ts from 'typescript';
 
 const path = new URL('../src/App.tsx', import.meta.url);
 const source = ts.createSourceFile('App.tsx', fs.readFileSync(path, 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
-const app = source.statements.find(s => ts.isFunctionDeclaration(s) && s.name?.text === 'App');
+const app = source.statements.find(s => ts.isFunctionDeclaration(s) && s.name?.text === 'MainWindowApp');
 const effect = app.body.statements.find(s => ts.isExpressionStatement(s) &&
   ts.isCallExpression(s.expression) && s.expression.expression.getText(source) === 'useEffect' &&
   s.expression.arguments[0].getText(source).includes('const initWebRTC ='));

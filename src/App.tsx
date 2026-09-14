@@ -39,42 +39,27 @@ import { isSafeResourceId, sanitizeUntrustedText } from './security/trustBoundar
 import './App.css';
 
 function App() {
-  const { i18n } = useTranslation();
-  const appState = useAppStore((state) => state.appState);
-  const lobby = useAppStore((state) => state.lobby);
-  const setMicEnabled = useAppStore((state) => state.setMicEnabled);
-  const addPlayer = useAppStore((state) => state.addPlayer);
-  const removePlayer = useAppStore((state) => state.removePlayer);
-  const updatePlayerStatus = useAppStore((state) => state.updatePlayerStatus);
-  const currentPlayerId = useAppStore((state) => state.currentPlayerId);
-  const addChatMessage = useAppStore((state) => state.addChatMessage);
-  const setPlayerSpeaking = useAppStore((state) => state.setPlayerSpeaking);
-  const [showMicrophonePermissionHelp, setShowMicrophonePermissionHelp] = useState(false);
-  const [themePreference, setThemePreference] = useState<ThemePreference>(readThemePreference);
-  const [systemDark, setSystemDark] = useState(
-    () => window.matchMedia('(prefers-color-scheme: dark)').matches
-  );
-  const effectiveTheme = resolveTheme(themePreference, systemDark);
+  const search = window.location.search;
+  if (search.includes('danmaku=true')) return <DanmakuOverlay />;
+  if (search.includes('gamehud=true')) return <GameHudOverlay />;
+  if (search.includes('screen-viewer=true')) return <ScreenViewerWindow />;
+  return <MainWindowApp />;
+}
 
-  // 版本更新状态
-  const [showVersionModal, setShowVersionModal] = useState(false);
-  const [versionInfo, setVersionInfo] = useState<{
-    latestVersion: string;
-    currentVersion: string;
-    updateMessage: string[];
-  } | null>(null);
-
+function useLanguagePreference(): void {
   useEffect(() => {
     void invoke<{ language?: LanguagePreference }>('get_settings')
       .then((settings) => setLanguagePreference(settings.language ?? getLanguagePreference()))
       .catch((error) => console.error('读取语言设置失败:', error));
   }, []);
+}
 
-  useEffect(() => {
-    const showHelp = () => setShowMicrophonePermissionHelp(true);
-    window.addEventListener('mctier-microphone-permission-required', showHelp);
-    return () => window.removeEventListener('mctier-microphone-permission-required', showHelp);
-  }, []);
+function useResolvedTheme(): ThemePreference {
+  const [themePreference, setThemePreference] = useState<ThemePreference>(readThemePreference);
+  const [systemDark, setSystemDark] = useState(
+    () => window.matchMedia('(prefers-color-scheme: dark)').matches
+  );
+  const effectiveTheme = resolveTheme(themePreference, systemDark);
 
   useEffect(() => {
     const media = window.matchMedia('(prefers-color-scheme: dark)');
@@ -96,61 +81,78 @@ function App() {
     document.documentElement.style.colorScheme = effectiveTheme;
   }, [effectiveTheme]);
 
-  // 检测是否是屏幕查看窗口
-  const isScreenViewerWindow = window.location.search.includes('screen-viewer=true');
+  return effectiveTheme;
+}
 
-  // 弹幕覆盖窗口：只渲染弹幕层（透明、置顶、穿透）
-  const isDanmakuWindow = window.location.search.includes('danmaku=true');
-  if (isDanmakuWindow) {
-    return <DanmakuOverlay />;
-  }
+function ScreenViewerWindow() {
+  useLanguagePreference();
+  const effectiveTheme = useResolvedTheme();
+  const urlParams = new URLSearchParams(window.location.search);
+  const rawShareId = urlParams.get('shareId');
+  const shareId = isSafeResourceId(rawShareId) ? rawShareId : '';
+  const playerName =
+    sanitizeUntrustedText(urlParams.get('playerName'), 64).trim() ||
+    tl('未知玩家', 'Unknown Player');
 
-  // 游戏 HUD 浮层窗口：只渲染 HUD（透明、置顶、穿透）
-  const isGameHudWindow = window.location.search.includes('gamehud=true');
-  if (isGameHudWindow) {
-    return <GameHudOverlay />;
-  }
+  return (
+    <ErrorBoundary>
+      <ConfigProvider
+        locale={getLanguage() === 'en' ? enUS : zhCN}
+        theme={{
+          algorithm: effectiveTheme === 'dark' ? theme.darkAlgorithm : theme.defaultAlgorithm,
+          token: {
+            colorPrimary: '#52c41a',
+            colorSuccess: '#52c41a',
+            colorWarning: '#f59e0b',
+            colorError: '#ef4444',
+            borderRadius: 8,
+            colorBgContainer: effectiveTheme === 'dark' ? 'rgba(30, 30, 45, 0.95)' : '#ffffff',
+            colorBorder:
+              effectiveTheme === 'dark' ? 'rgba(255, 255, 255, 0.1)' : 'rgba(24, 32, 43, 0.16)',
+            colorText: effectiveTheme === 'dark' ? 'rgba(255, 255, 255, 0.9)' : '#18202b',
+            colorTextSecondary:
+              effectiveTheme === 'dark' ? 'rgba(255, 255, 255, 0.6)' : '#596574',
+            fontFamily:
+              '-apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif',
+          },
+        }}
+      >
+        <AntdApp>
+          <ScreenViewer shareId={shareId} playerName={playerName} />
+        </AntdApp>
+      </ConfigProvider>
+    </ErrorBoundary>
+  );
+}
 
-  // 如果是屏幕查看窗口，直接渲染ScreenViewer组件
-  if (isScreenViewerWindow) {
-    // 从URL参数中获取shareId和playerName
-    const urlParams = new URLSearchParams(window.location.search);
-    const rawShareId = urlParams.get('shareId');
-    const shareId = isSafeResourceId(rawShareId) ? rawShareId : '';
-    const playerName =
-      sanitizeUntrustedText(urlParams.get('playerName'), 64).trim() ||
-      tl('未知玩家', 'Unknown Player');
+function MainWindowApp() {
+  useLanguagePreference();
+  const effectiveTheme = useResolvedTheme();
+  const { i18n } = useTranslation();
+  const appState = useAppStore((state) => state.appState);
+  const lobby = useAppStore((state) => state.lobby);
+  const setMicEnabled = useAppStore((state) => state.setMicEnabled);
+  const addPlayer = useAppStore((state) => state.addPlayer);
+  const removePlayer = useAppStore((state) => state.removePlayer);
+  const updatePlayerStatus = useAppStore((state) => state.updatePlayerStatus);
+  const currentPlayerId = useAppStore((state) => state.currentPlayerId);
+  const addChatMessage = useAppStore((state) => state.addChatMessage);
+  const setPlayerSpeaking = useAppStore((state) => state.setPlayerSpeaking);
+  const [showMicrophonePermissionHelp, setShowMicrophonePermissionHelp] = useState(false);
 
-    return (
-      <ErrorBoundary>
-        <ConfigProvider
-          locale={getLanguage() === 'en' ? enUS : zhCN}
-          theme={{
-            algorithm: effectiveTheme === 'dark' ? theme.darkAlgorithm : theme.defaultAlgorithm,
-            token: {
-              colorPrimary: '#52c41a',
-              colorSuccess: '#52c41a',
-              colorWarning: '#f59e0b',
-              colorError: '#ef4444',
-              borderRadius: 8,
-              colorBgContainer: effectiveTheme === 'dark' ? 'rgba(30, 30, 45, 0.95)' : '#ffffff',
-              colorBorder:
-                effectiveTheme === 'dark' ? 'rgba(255, 255, 255, 0.1)' : 'rgba(24, 32, 43, 0.16)',
-              colorText: effectiveTheme === 'dark' ? 'rgba(255, 255, 255, 0.9)' : '#18202b',
-              colorTextSecondary:
-                effectiveTheme === 'dark' ? 'rgba(255, 255, 255, 0.6)' : '#596574',
-              fontFamily:
-                '-apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif',
-            },
-          }}
-        >
-          <AntdApp>
-            <ScreenViewer shareId={shareId} playerName={playerName} />
-          </AntdApp>
-        </ConfigProvider>
-      </ErrorBoundary>
-    );
-  }
+  // 版本更新状态
+  const [showVersionModal, setShowVersionModal] = useState(false);
+  const [versionInfo, setVersionInfo] = useState<{
+    latestVersion: string;
+    currentVersion: string;
+    updateMessage: string[];
+  } | null>(null);
+
+  useEffect(() => {
+    const showHelp = () => setShowMicrophonePermissionHelp(true);
+    window.addEventListener('mctier-microphone-permission-required', showHelp);
+    return () => window.removeEventListener('mctier-microphone-permission-required', showHelp);
+  }, []);
 
   // 同步系统托盘菜单文本到当前界面语言（启动时 + 语言切换时）
   useEffect(() => {

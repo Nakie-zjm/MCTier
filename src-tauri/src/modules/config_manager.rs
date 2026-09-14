@@ -435,9 +435,15 @@ impl Default for UserConfig {
 impl UserConfig {
     fn migrate_legacy_signaling_server(&mut self) {
         let legacy = self.private_signaling_server.as_deref().map(str::trim);
-        if matches!(legacy.map(|url| url.trim_end_matches('/')),
-            Some("ws://test.pmhs.top" | "wss://test.pmhs.top" |
-                 "ws://test.pmhs.top/signaling" | "wss://test.pmhs.top/signaling")) {
+        if matches!(
+            legacy.map(|url| url.trim_end_matches('/')),
+            Some(
+                "ws://test.pmhs.top"
+                    | "wss://test.pmhs.top"
+                    | "ws://test.pmhs.top/signaling"
+                    | "wss://test.pmhs.top/signaling"
+            )
+        ) {
             self.private_signaling_server = Some("wss://mctier.pmhs.top/signaling".to_string());
         }
     }
@@ -620,10 +626,17 @@ impl ConfigManager {
     /// * `Err(AppError)` - 更新失败
     ///
     /// # 示例
-    /// ```rust
+    /// ```no_run
+    /// use mctier_lib::modules::config_manager::ConfigManager;
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut manager = ConfigManager::load().await?;
     /// manager.update_config(|config| {
     ///     config.player_name = Some("新玩家".to_string());
     /// }).await?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub async fn update_config<F>(&mut self, updater: F) -> Result<(), AppError>
     where
@@ -948,13 +961,26 @@ mod tests {
     #[test]
     fn legacy_signaling_defaults_migrate_without_replacing_custom_endpoints() {
         let mut config = UserConfig::default();
-        assert_eq!(config.private_signaling_server.as_deref(), Some("wss://mctier.pmhs.top/signaling"));
-        for old in ["wss://test.pmhs.top", "ws://test.pmhs.top/", "wss://test.pmhs.top/signaling"] {
+        assert_eq!(
+            config.private_signaling_server.as_deref(),
+            Some("wss://mctier.pmhs.top/signaling")
+        );
+        for old in [
+            "wss://test.pmhs.top",
+            "ws://test.pmhs.top/",
+            "wss://test.pmhs.top/signaling",
+        ] {
             config.private_signaling_server = Some(old.to_string());
             config.migrate_legacy_signaling_server();
-            assert_eq!(config.private_signaling_server.as_deref(), Some("wss://mctier.pmhs.top/signaling"));
+            assert_eq!(
+                config.private_signaling_server.as_deref(),
+                Some("wss://mctier.pmhs.top/signaling")
+            );
         }
-        for custom in ["wss://signal.example.com/private", "wss://test.pmhs.top/custom"] {
+        for custom in [
+            "wss://signal.example.com/private",
+            "wss://test.pmhs.top/custom",
+        ] {
             config.private_signaling_server = Some(custom.to_string());
             config.migrate_legacy_signaling_server();
             assert_eq!(config.private_signaling_server.as_deref(), Some(custom));
