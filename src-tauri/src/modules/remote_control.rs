@@ -9,6 +9,14 @@
 //   无需提权。
 
 use serde::Deserialize;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+const MAX_REMOTE_INPUT_EVENTS: usize = 128;
+const MAX_REMOTE_TEXT_CHARS: usize = 256;
+const MAX_REMOTE_TEXT_TOTAL_CHARS: usize = 1024;
+const MAX_REMOTE_KEY_NAME_LEN: usize = 32;
+const REMOTE_INPUT_GRANT_IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 /// 单个远程输入事件（与前端协议一致）
 #[derive(Debug, Clone, Deserialize)]
@@ -43,9 +51,175 @@ pub enum RemoteInputEvent {
     Unknown,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct RemoteInputGrant {
+    session_id: String,
+    controller_id: String,
+    expires_at: Instant,
+}
+
+#[derive(Default)]
+struct RemoteInputAuthorization {
+    grant: Option<RemoteInputGrant>,
+}
+
+impl RemoteInputAuthorization {
+    fn authorize(&mut self, session_id: &str, controller_id: &str) -> Result<(), String> {
+        validate_remote_identity(session_id, controller_id)?;
+        self.grant = Some(RemoteInputGrant {
+            session_id: session_id.to_owned(),
+            controller_id: controller_id.to_owned(),
+            expires_at: Instant::now() + REMOTE_INPUT_GRANT_IDLE_TIMEOUT,
+        });
+        Ok(())
+    }
+
+    fn consume(&mut self, session_id: &str, controller_id: &str) -> bool {
+        let now = Instant::now();
+        self.grant = self.grant.take().filter(|grant| grant.expires_at > now);
+        let authorized = self.grant.as_ref().is_some_and(|grant| {
+            grant.session_id == session_id && grant.controller_id == controller_id
+        });
+        if authorized {
+            if let Some(grant) = self.grant.as_mut() {
+                grant.expires_at = now + REMOTE_INPUT_GRANT_IDLE_TIMEOUT;
+            }
+        }
+        authorized
+    }
+
+    fn revoke(&mut self, session_id: &str, controller_id: &str) {
+        self.grant = self
+            .grant
+            .take()
+            .filter(|grant| grant.session_id != session_id || grant.controller_id != controller_id);
+    }
+}
+
+fn remote_input_authorization() -> &'static Mutex<RemoteInputAuthorization> {
+    static VALUE: OnceLock<Mutex<RemoteInputAuthorization>> = OnceLock::new();
+    VALUE.get_or_init(|| Mutex::new(RemoteInputAuthorization::default()))
+}
+
+fn ensure_main_window(window: &tauri::WebviewWindow) -> Result<(), String> {
+    if window.label() == "main" {
+        Ok(())
+    } else {
+        Err("远程控制输入仅允许主窗口操作".to_string())
+    }
+}
+
+fn validate_remote_identity(session_id: &str, controller_id: &str) -> Result<(), String> {
+    let valid = |value: &str, max_len: usize| {
+        !value.is_empty()
+            && value.len() <= max_len
+            && !value.chars().any(char::is_control)
+            && !value.chars().any(char::is_whitespace)
+    };
+    if !valid(session_id, 192) || !valid(controller_id, 128) {
+        return Err("远程控制会话身份无效".to_string());
+    }
+    Ok(())
+}
+
+fn validate_remote_input_events(events: &[RemoteInputEvent]) -> Result<(), String> {
+    if events.is_empty() || events.len() > MAX_REMOTE_INPUT_EVENTS {
+        return Err(format!(
+            "远程输入批次必须在 1 到 {} 个事件之间",
+            MAX_REMOTE_INPUT_EVENTS
+        ));
+    }
+
+    let mut total_text_chars = 0usize;
+    for event in events {
+        let coordinates = match event {
+            RemoteInputEvent::MouseMove { x, y }
+            | RemoteInputEvent::MouseDown { x, y, .. }
+            | RemoteInputEvent::MouseUp { x, y, .. } => Some((*x, *y)),
+            RemoteInputEvent::MouseWheel { dx, dy } => Some((*dx, *dy)),
+            _ => None,
+        };
+        if coordinates.is_some_and(|(x, y)| !x.is_finite() || !y.is_finite()) {
+            return Err("远程输入坐标无效".to_string());
+        }
+        if matches!(event, RemoteInputEvent::MouseDown { button, .. } if *button > 2)
+            || matches!(event, RemoteInputEvent::MouseUp { button, .. } if *button > 2)
+        {
+            return Err("远程鼠标按键无效".to_string());
+        }
+        if matches!(event, RemoteInputEvent::KeyDown { code, .. } if *code > u16::MAX as u32)
+            || matches!(event, RemoteInputEvent::KeyUp { code, .. } if *code > u16::MAX as u32)
+        {
+            return Err("远程键盘按键无效".to_string());
+        }
+        if let RemoteInputEvent::Text { text } = event {
+            let chars = text.chars().count();
+            if chars > MAX_REMOTE_TEXT_CHARS {
+                return Err("远程文本输入过长".to_string());
+            }
+            total_text_chars = total_text_chars.saturating_add(chars);
+            if total_text_chars > MAX_REMOTE_TEXT_TOTAL_CHARS {
+                return Err("远程文本总量超过限制".to_string());
+            }
+        }
+        if matches!(event, RemoteInputEvent::NamedKey { key } if key.len() > MAX_REMOTE_KEY_NAME_LEN)
+        {
+            return Err("远程按键名称无效".to_string());
+        }
+    }
+    Ok(())
+}
+
+/// Record the remote-control session accepted by the local user. The renderer
+/// must call this only from the acceptance flow; injection remains bound to
+/// this exact session and controller identity.
+#[tauri::command]
+pub fn authorize_remote_input(
+    window: tauri::WebviewWindow,
+    session_id: String,
+    controller_id: String,
+) -> Result<(), String> {
+    ensure_main_window(&window)?;
+    let mut authorization = remote_input_authorization()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    authorization.authorize(&session_id, &controller_id)
+}
+
+#[tauri::command]
+pub fn revoke_remote_input(
+    window: tauri::WebviewWindow,
+    session_id: String,
+    controller_id: String,
+) {
+    if ensure_main_window(&window).is_err() {
+        return;
+    }
+    let mut authorization = remote_input_authorization()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    authorization.revoke(&session_id, &controller_id);
+}
+
 /// 注入一批输入事件
 #[tauri::command]
-pub fn remote_inject_input(events: Vec<RemoteInputEvent>) -> Result<(), String> {
+pub fn remote_inject_input(
+    window: tauri::WebviewWindow,
+    session_id: String,
+    controller_id: String,
+    events: Vec<RemoteInputEvent>,
+) -> Result<(), String> {
+    ensure_main_window(&window)?;
+    validate_remote_identity(&session_id, &controller_id)?;
+    validate_remote_input_events(&events)?;
+    {
+        let mut authorization = remote_input_authorization()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !authorization.consume(&session_id, &controller_id) {
+            return Err("远程控制会话未授权或已过期".to_string());
+        }
+    }
     #[cfg(target_os = "windows")]
     {
         platform::inject(&events)
@@ -58,6 +232,62 @@ pub fn remote_inject_input(events: Vec<RemoteInputEvent>) -> Result<(), String> 
     {
         let _ = events;
         Err("远程控制注入暂不支持当前平台".to_string())
+    }
+}
+
+#[cfg(test)]
+mod remote_input_security_tests {
+    use super::*;
+
+    fn text(value: &str) -> RemoteInputEvent {
+        RemoteInputEvent::Text {
+            text: value.to_owned(),
+        }
+    }
+
+    #[test]
+    fn grants_are_bound_to_one_session_and_controller() {
+        let mut authorization = RemoteInputAuthorization::default();
+        authorization
+            .authorize("rc-session", "controller-id")
+            .unwrap();
+        assert!(authorization.consume("rc-session", "controller-id"));
+        assert!(!authorization.consume("other-session", "controller-id"));
+        assert!(!authorization.consume("rc-session", "other-controller"));
+        authorization.revoke("rc-session", "controller-id");
+        assert!(!authorization.consume("rc-session", "controller-id"));
+    }
+
+    #[test]
+    fn grants_expire_after_idle() {
+        let mut authorization = RemoteInputAuthorization::default();
+        authorization.grant = Some(RemoteInputGrant {
+            session_id: "rc-session".to_owned(),
+            controller_id: "controller-id".to_owned(),
+            expires_at: Instant::now() - Duration::from_millis(1),
+        });
+        assert!(!authorization.consume("rc-session", "controller-id"));
+        assert!(authorization.grant.is_none());
+    }
+
+    #[test]
+    fn input_batches_are_bounded_and_shape_checked() {
+        assert!(validate_remote_input_events(&[text("hello")]).is_ok());
+        let too_many = vec![text("x"); MAX_REMOTE_INPUT_EVENTS + 1];
+        assert!(validate_remote_input_events(&too_many).is_err());
+        assert!(validate_remote_input_events(&[]).is_err());
+        assert!(
+            validate_remote_input_events(&[text(&"x".repeat(MAX_REMOTE_TEXT_CHARS + 1))]).is_err()
+        );
+        let oversized_total = vec![text(&"x".repeat(MAX_REMOTE_TEXT_CHARS)); 5];
+        assert!(validate_remote_input_events(&oversized_total).is_err());
+        assert!(
+            validate_remote_input_events(&[RemoteInputEvent::MouseWheel {
+                dx: f64::NAN,
+                dy: 0.0,
+            }])
+            .is_err()
+        );
     }
 }
 

@@ -126,7 +126,7 @@ use modules::minecraft_discovery::{
 
 use modules::mc_lan_bridge::{start_mc_lan_broadcast, stop_mc_lan_broadcast};
 
-use modules::remote_control::remote_inject_input;
+use modules::remote_control::{authorize_remote_input, remote_inject_input, revoke_remote_input};
 
 #[tauri::command]
 fn greet(name: &str) -> String {
@@ -1195,7 +1195,9 @@ pub fn run() {
             start_mc_lan_broadcast, stop_mc_lan_broadcast,
             set_tray_menu_texts,
             minimize_main_window_to_tray,
+            authorize_remote_input,
             remote_inject_input,
+            revoke_remote_input,
             apply_hotkeys,
         ])
         .setup(|app| {

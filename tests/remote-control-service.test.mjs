@@ -207,6 +207,32 @@ test('request timeout notifies the pending peer before local cleanup', () => {
   assert.ok(timerBlock.indexOf("type: 'remote-control-stop'") < timerBlock.indexOf("this.finishReject('timeout')"));
 });
 
+test('controlled input is authorized for the accepted session and revoked on cleanup', () => {
+  const acceptBlock = serviceSource.slice(
+    serviceSource.indexOf('async acceptControl'),
+    serviceSource.indexOf('rejectControl'),
+  );
+  const authorizeCall = acceptBlock.indexOf("invoke('authorize_remote_input'");
+  const acceptSignal = acceptBlock.indexOf("type: 'remote-control-accept'");
+  assert.ok(authorizeCall >= 0 && authorizeCall < acceptSignal);
+
+  const cleanupBlock = serviceSource.slice(
+    serviceSource.indexOf('private cleanup'),
+    serviceSource.indexOf('// ==================== 信令处理'),
+  );
+  assert.match(cleanupBlock, /invoke\('revoke_remote_input'/);
+  assert.match(cleanupBlock, /sessionId: endedSessionId/);
+  assert.match(cleanupBlock, /controllerId: endedControllerId/);
+
+  const inputBlock = serviceSource.slice(
+    serviceSource.indexOf('private async onInputMessage'),
+    serviceSource.indexOf('handlePeerLeft'),
+  );
+  assert.match(inputBlock, /events\.length <= MAX_REMOTE_INPUT_EVENTS/);
+  assert.match(inputBlock, /sessionId,/);
+  assert.match(inputBlock, /controllerId: peerId/);
+});
+
 test('Android delayed accept is invalidated across lobby lifecycle changes', () => {
   const acceptBlock = androidRepository.slice(
     androidRepository.indexOf('fun acceptRemoteControl'),

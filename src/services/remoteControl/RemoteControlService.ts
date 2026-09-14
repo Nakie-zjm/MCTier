@@ -34,6 +34,8 @@ const RTC_CONFIG: RTCConfiguration = {
   rtcpMuxPolicy: 'require',
 };
 
+const MAX_REMOTE_INPUT_EVENTS = 128;
+
 class RemoteControlService {
   private playerId = '';
   private playerName = '';
@@ -175,6 +177,7 @@ class RemoteControlService {
           if (this.isCurrentPeerSession(sessionId, controllerId) && this.localStream === stream) this.stopControl();
         };
       }
+      await invoke('authorize_remote_input', { sessionId, controllerId });
       this.send({
         type: 'remote-control-accept',
         from: this.playerId,
@@ -236,6 +239,12 @@ class RemoteControlService {
       clearInterval(this.flushTimer);
       this.flushTimer = null;
     }
+    const endedSessionId = this.sessionId;
+    const endedControllerId = this.peerId;
+    void invoke('revoke_remote_input', {
+      sessionId: endedSessionId,
+      controllerId: endedControllerId,
+    }).catch(() => {});
     this.pendingInput = [];
     this.pendingIce = [];
     this.pendingRequest = null;
@@ -422,10 +431,11 @@ class RemoteControlService {
     if (!isSafeSessionId(sessionId) || !isSafeIdentifier(from) || from === this.playerId || to !== this.playerId ||
         !candidate || typeof candidate.candidate !== 'string' || candidate.candidate.length === 0 ||
         candidate.candidate.length > 16 * 1024 ||
-        (candidate.sdpMLineIndex != null &&
+        (candidate.sdpMLineIndex !== null && candidate.sdpMLineIndex !== undefined &&
           (typeof candidate.sdpMLineIndex !== 'number' || !Number.isSafeInteger(candidate.sdpMLineIndex) ||
             candidate.sdpMLineIndex < 0 || candidate.sdpMLineIndex > 256)) ||
-        (candidate.sdpMid != null && (typeof candidate.sdpMid !== 'string' || candidate.sdpMid.length > 128)) ||
+        (candidate.sdpMid !== null && candidate.sdpMid !== undefined &&
+          (typeof candidate.sdpMid !== 'string' || candidate.sdpMid.length > 128)) ||
         !this.isCurrentPeerMessage(sessionId, from, to)) return;
     if (this.pendingIce.length >= 256) return;
     const pc = this.pc;
@@ -527,8 +537,17 @@ class RemoteControlService {
     if (this.role !== 'controlled' || this.inputChannel !== channel || channel.readyState !== 'open' || !this.isCurrentPeerSession(sessionId, peerId, pc)) return;
     try {
       const events = JSON.parse(typeof data === 'string' ? data : String(data));
-      if (Array.isArray(events) && events.length && this.isCurrentPeerSession(sessionId, peerId, pc)) {
-        await invoke('remote_inject_input', { events });
+      if (
+        Array.isArray(events) &&
+        events.length > 0 &&
+        events.length <= MAX_REMOTE_INPUT_EVENTS &&
+        this.isCurrentPeerSession(sessionId, peerId, pc)
+      ) {
+        await invoke('remote_inject_input', {
+          sessionId,
+          controllerId: peerId,
+          events,
+        });
       }
     } catch (e) {
       console.warn('注入输入失败', e);
