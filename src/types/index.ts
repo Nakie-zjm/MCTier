@@ -175,9 +175,11 @@ export interface ChatMessage {
   /** 发送时间戳 */
   timestamp: number;
   /** 消息类型 */
-  type?: 'text' | 'image';
+  type?: 'text' | 'image' | 'voice' | 'file';
   /** 图片数据（Base64） */
   imageData?: string;
+  /** 按需从发送端获取的文件附件元数据，文件字节不进入聊天历史。 */
+  attachment?: import('../services/chat/fileAttachment').ChatAttachment;
   /** 消息是否已由原发送者撤回 */
   recalled?: boolean;
   recipientId?: string;

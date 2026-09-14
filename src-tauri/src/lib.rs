@@ -84,6 +84,7 @@ fn reset_microphone_permission_cache_on_startup() {
     }
 }
 
+use modules::builtin_emoji::sync_builtin_emoji;
 use modules::tauri_commands::{
     add_firewall_rules, add_player_domain, add_shared_folder, broadcast_status_update,
     cancel_lobby_connecting, cancel_remote_download, check_auto_start, check_file_server_status,
@@ -91,27 +92,28 @@ use modules::tauri_commands::{
     clear_avatar_cache, clear_p2p_chat_messages, close_danmaku_window, close_game_hud_window,
     configure_p2p_chat, create_lobby, danmaku_cursor_pos, delete_file, detect_security_software,
     diagnose_file_share_connection, download_remote_batch, download_remote_file, exit_app,
-    export_config, export_logs, extract_zip, force_stop_easytier, gamehud_cursor_pos,
-    get_app_state, get_audio_devices, get_config, get_current_lobby, get_download_url,
-    get_exit_node_advanced_config, get_file_share_download_dir, get_file_share_download_path,
-    get_folder_info, get_folder_name, get_global_mute_status, get_local_shares, get_log_file_path,
-    get_mic_status, get_network_status, get_p2p_chat_messages, get_peer_connection_types,
-    get_players, get_remote_files, get_remote_shares, get_settings, get_virtual_ip, import_config,
-    is_admin, is_player_muted, join_lobby, leave_lobby, list_directory_files, mute_all,
-    mute_player, open_danmaku_window, open_file_location, open_folder, open_game_hud_window,
-    open_log_file, open_log_folder, open_microphone_privacy_settings, open_screen_viewer_window,
-    ping_virtual_ip, prepare_p2p_chat_identity, prepare_signaling_identity, read_file,
-    read_file_bytes, read_log_file, remove_player_domain, remove_shared_folder,
-    reset_config_to_default, reset_microphone_permission, restart_app_with_gpu_settings,
-    restart_as_admin, save_chat_image, save_danmaku_image, save_exit_node_advanced_config,
-    save_file, save_opacity, save_settings, save_voice_volume, save_window_position, select_file,
-    select_file_share_download_folder, select_folder, select_save_location, send_heartbeat,
-    send_p2p_chat_message, send_signaling_message, set_always_on_top, set_auto_start,
-    set_avatar_data, set_danmaku_ignore_cursor, set_file_share_download_dir,
-    set_gamehud_ignore_cursor, set_mic_enabled, set_window_opacity, sign_signaling_registration,
-    start_file_server, stop_file_server, stop_p2p_chat, test_node_latency, toggle_mic,
-    toggle_mini_mode, update_config, update_p2p_chat_peers, verify_share_password,
-    write_file_bytes,
+    export_config, export_logs, extract_zip, fetch_chat_attachment, force_stop_easytier,
+    gamehud_cursor_pos, get_app_state, get_audio_devices, get_config, get_current_lobby,
+    get_download_url, get_exit_node_advanced_config, get_file_share_download_dir,
+    get_file_share_download_path, get_folder_info, get_folder_name, get_global_mute_status,
+    get_local_shares, get_log_file_path, get_mic_status, get_network_status, get_p2p_chat_messages,
+    get_peer_connection_types, get_players, get_remote_files, get_remote_shares, get_settings,
+    get_virtual_ip, import_config, is_admin, is_player_muted, join_lobby, leave_lobby,
+    list_directory_files, mute_all, mute_player, open_danmaku_window, open_external_url,
+    open_file_location, open_folder, open_game_hud_window, open_log_file, open_log_folder,
+    open_microphone_privacy_settings, open_screen_viewer_window, ping_virtual_ip,
+    prepare_p2p_chat_identity, prepare_signaling_identity, read_file, read_file_bytes,
+    read_log_file, remove_player_domain, remove_shared_folder, reset_config_to_default,
+    reset_microphone_permission, restart_app_with_gpu_settings, restart_as_admin,
+    preview_office_attachment, preview_spreadsheet_attachment, save_chat_attachment, save_chat_image, save_danmaku_image, save_exit_node_advanced_config,
+    save_file, save_opacity, save_settings, save_voice_volume, save_window_position,
+    select_chat_attachment, select_file, select_file_share_download_folder, select_folder,
+    select_save_location, send_heartbeat, send_p2p_chat_message, send_signaling_message,
+    set_always_on_top, set_auto_start, set_avatar_data, set_danmaku_ignore_cursor,
+    set_file_share_download_dir, set_gamehud_ignore_cursor, set_mic_enabled, set_window_opacity,
+    sign_signaling_registration, start_file_server, stop_file_server, stop_p2p_chat,
+    test_node_latency, toggle_mic, toggle_mini_mode, transcribe_voice_message, update_config, update_p2p_chat_peers,
+    verify_share_password, write_file_bytes,
 };
 
 use modules::easytier_advanced_commands::{
@@ -1147,52 +1149,142 @@ pub fn run() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .manage(app_state)
         .invoke_handler(tauri::generate_handler![
-            greet, open_devtools,
-            create_lobby, join_lobby, leave_lobby,
-            toggle_mic, set_mic_enabled, open_microphone_privacy_settings, reset_microphone_permission, mute_player, mute_all,
-            get_config, update_config, save_opacity,
-            get_audio_devices, get_app_state, get_current_lobby, get_players,
-            get_mic_status, get_global_mute_status, is_player_muted,
-            get_network_status, get_virtual_ip, get_peer_connection_types,
-            set_always_on_top, toggle_mini_mode, set_window_opacity,
-            send_signaling_message, broadcast_status_update, send_heartbeat,
+            sync_builtin_emoji,
+            modules::secret_store::protect_lobby_password,
+            modules::secret_store::export_lobby_password,
+            greet,
+            open_devtools,
+            create_lobby,
+            join_lobby,
+            leave_lobby,
+            toggle_mic,
+            set_mic_enabled,
+            open_microphone_privacy_settings,
+            reset_microphone_permission,
+            mute_player,
+            mute_all,
+            get_config,
+            update_config,
+            save_opacity,
+            get_audio_devices,
+            get_app_state,
+            get_current_lobby,
+            get_players,
+            get_mic_status,
+            get_global_mute_status,
+            is_player_muted,
+            get_network_status,
+            get_virtual_ip,
+            get_peer_connection_types,
+            set_always_on_top,
+            toggle_mini_mode,
+            set_window_opacity,
+            send_signaling_message,
+            broadcast_status_update,
+            send_heartbeat,
             force_stop_easytier,
             cancel_lobby_connecting,
-            check_virtual_adapter, check_firewall_rules, ping_virtual_ip, check_udp_port,
-            is_admin, add_firewall_rules, restart_as_admin,
-            save_window_position, exit_app,
-            add_player_domain, remove_player_domain,
-            get_folder_name, get_folder_info, list_directory_files,
-            read_file_bytes, write_file_bytes, select_folder, select_file, select_save_location,
-            select_file_share_download_folder, get_file_share_download_dir, set_file_share_download_dir,
+            check_virtual_adapter,
+            check_firewall_rules,
+            ping_virtual_ip,
+            check_udp_port,
+            is_admin,
+            add_firewall_rules,
+            restart_as_admin,
+            save_window_position,
+            exit_app,
+            add_player_domain,
+            remove_player_domain,
+            get_folder_name,
+            get_folder_info,
+            list_directory_files,
+            read_file_bytes,
+            write_file_bytes,
+            select_folder,
+            select_file,
+            select_save_location,
+            select_file_share_download_folder,
+            get_file_share_download_dir,
+            set_file_share_download_dir,
             get_file_share_download_path,
-            save_file, save_chat_image, read_file, delete_file, extract_zip,
-            open_file_location, open_folder,
-            start_file_server, stop_file_server, check_file_server_status,
-            add_shared_folder, remove_shared_folder, get_local_shares,
-            cleanup_expired_shares, get_remote_shares, get_remote_files,
-            verify_share_password, get_download_url, diagnose_file_share_connection,
-            download_remote_file, cancel_remote_download, export_logs, test_node_latency,
-            download_remote_batch, detect_security_software,
-            prepare_p2p_chat_identity, prepare_signaling_identity, sign_signaling_registration,
-            configure_p2p_chat, update_p2p_chat_peers, stop_p2p_chat,
-            send_p2p_chat_message, get_p2p_chat_messages, clear_p2p_chat_messages,
+            save_file,
+            save_chat_image,
+            read_file,
+            delete_file,
+            extract_zip,
+            open_external_url,
+            open_file_location,
+            open_folder,
+            start_file_server,
+            stop_file_server,
+            check_file_server_status,
+            add_shared_folder,
+            remove_shared_folder,
+            get_local_shares,
+            cleanup_expired_shares,
+            get_remote_shares,
+            get_remote_files,
+            verify_share_password,
+            get_download_url,
+            diagnose_file_share_connection,
+            download_remote_file,
+            cancel_remote_download,
+            export_logs,
+            test_node_latency,
+            download_remote_batch,
+            detect_security_software,
+            prepare_p2p_chat_identity,
+            prepare_signaling_identity,
+            sign_signaling_registration,
+            configure_p2p_chat,
+            update_p2p_chat_peers,
+            stop_p2p_chat,
+            select_chat_attachment,
+            fetch_chat_attachment,
+            save_chat_attachment,
+            preview_spreadsheet_attachment,
+            preview_office_attachment,
+            transcribe_voice_message,
+            send_p2p_chat_message,
+            get_p2p_chat_messages,
+            clear_p2p_chat_messages,
             open_screen_viewer_window,
-            open_danmaku_window, close_danmaku_window,
-            set_danmaku_ignore_cursor, danmaku_cursor_pos, save_danmaku_image,
-            open_game_hud_window, close_game_hud_window,
-            set_gamehud_ignore_cursor, gamehud_cursor_pos,
-            open_log_folder, open_log_file, get_log_file_path, read_log_file, set_avatar_data, clear_avatar_cache,
-            save_settings, get_settings, set_auto_start, check_auto_start,
-            reset_config_to_default, save_voice_volume,
-            export_config, import_config,
+            open_danmaku_window,
+            close_danmaku_window,
+            set_danmaku_ignore_cursor,
+            danmaku_cursor_pos,
+            save_danmaku_image,
+            open_game_hud_window,
+            close_game_hud_window,
+            set_gamehud_ignore_cursor,
+            gamehud_cursor_pos,
+            open_log_folder,
+            open_log_file,
+            get_log_file_path,
+            read_log_file,
+            set_avatar_data,
+            clear_avatar_cache,
+            save_settings,
+            get_settings,
+            set_auto_start,
+            check_auto_start,
+            reset_config_to_default,
+            save_voice_volume,
+            export_config,
+            import_config,
             restart_app_with_gpu_settings,
-            save_exit_node_advanced_config, get_exit_node_advanced_config,
-            save_global_easytier_advanced_config, get_global_easytier_advanced_config,
-            save_lobby_easytier_advanced_config, get_lobby_easytier_advanced_config,
+            save_exit_node_advanced_config,
+            get_exit_node_advanced_config,
+            save_global_easytier_advanced_config,
+            get_global_easytier_advanced_config,
+            save_lobby_easytier_advanced_config,
+            get_lobby_easytier_advanced_config,
             clear_lobby_easytier_advanced_config,
-            scan_minecraft_servers, query_minecraft_server, measure_peers_latency,
-            start_mc_lan_broadcast, stop_mc_lan_broadcast,
+            scan_minecraft_servers,
+            query_minecraft_server,
+            measure_peers_latency,
+            start_mc_lan_broadcast,
+            stop_mc_lan_broadcast,
             set_tray_menu_texts,
             minimize_main_window_to_tray,
             remote_inject_input,
@@ -1218,8 +1310,10 @@ pub fn run() {
             {
                 use tauri::menu::{MenuBuilder, MenuItem};
                 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-                let show_item = MenuItem::with_id(app, "show_main", "显示 MCTier", true, None::<&str>)?;
-                let exit_item = MenuItem::with_id(app, "exit_app", "退出 MCTier", true, None::<&str>)?;
+                let show_item =
+                    MenuItem::with_id(app, "show_main", "显示 MCTier", true, None::<&str>)?;
+                let exit_item =
+                    MenuItem::with_id(app, "exit_app", "退出 MCTier", true, None::<&str>)?;
                 let tray_menu = MenuBuilder::new(app)
                     .item(&show_item)
                     .separator()
@@ -1236,15 +1330,21 @@ pub fn run() {
                         _ => {}
                     })
                     .on_tray_icon_event(|tray, event| {
-                        if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. }
-                            | TrayIconEvent::DoubleClick { button: MouseButton::Left, .. } = event
+                        if let TrayIconEvent::Click {
+                            button: MouseButton::Left,
+                            button_state: MouseButtonState::Up,
+                            ..
+                        }
+                        | TrayIconEvent::DoubleClick {
+                            button: MouseButton::Left,
+                            ..
+                        } = event
                         {
                             restore_main_window(tray.app_handle());
                         }
                     })
                     .build(app)?;
             }
-
 
             // 邀请 deep link：注册运行时 scheme 并监听冷启动/运行时打开的链接
             {
@@ -1291,15 +1391,26 @@ pub fn run() {
                 #[cfg(target_os = "windows")]
                 {
                     use windows::Win32::Foundation::HWND;
-                    use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
-                    use windows::Win32::UI::WindowsAndMessaging::{GWL_EXSTYLE, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW, GetWindowLongW, SetWindowLongW};
+                    use windows::Win32::Graphics::Dwm::{
+                        DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE,
+                    };
+                    use windows::Win32::UI::WindowsAndMessaging::{
+                        GetWindowLongW, SetWindowLongW, GWL_EXSTYLE, WS_EX_APPWINDOW,
+                        WS_EX_TOOLWINDOW,
+                    };
                     if let Ok(hwnd) = window.hwnd() {
                         let hwnd = HWND(hwnd.0 as *mut _);
                         unsafe {
                             let dm: i32 = 1;
-                            let _ = DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dm as *const _ as *const _, std::mem::size_of::<i32>() as u32);
+                            let _ = DwmSetWindowAttribute(
+                                hwnd,
+                                DWMWA_USE_IMMERSIVE_DARK_MODE,
+                                &dm as *const _ as *const _,
+                                std::mem::size_of::<i32>() as u32,
+                            );
                             let ex = GetWindowLongW(hwnd, GWL_EXSTYLE);
-                            let fixed_ex = (ex | WS_EX_APPWINDOW.0 as i32) & !(WS_EX_TOOLWINDOW.0 as i32);
+                            let fixed_ex =
+                                (ex | WS_EX_APPWINDOW.0 as i32) & !(WS_EX_TOOLWINDOW.0 as i32);
                             SetWindowLongW(hwnd, GWL_EXSTYLE, fixed_ex);
                         }
                     }
@@ -1327,7 +1438,9 @@ pub fn run() {
                         if remember_position {
                             if let Some(pos) = &config.window_position {
                                 use tauri::PhysicalPosition;
-                                if let Err(e) = win.set_position(PhysicalPosition::new(pos.x, pos.y)) {
+                                if let Err(e) =
+                                    win.set_position(PhysicalPosition::new(pos.x, pos.y))
+                                {
                                     error!("设置窗口位置失败: {}", e);
                                 } else {
                                     info!("窗口位置已恢复: x={}, y={}", pos.x, pos.y);
@@ -1349,25 +1462,6 @@ pub fn run() {
                 tauri::async_runtime::block_on(async move {
                     core.lock().await.set_app_handle(ah2).await;
                     info!("应用句柄已设置到 AppCore");
-                });
-            }
-            if let Some(state) = app.try_state::<AppState>() {
-                let core = Arc::clone(&state.core);
-                let ah3 = app.handle().clone();
-                tauri::async_runtime::spawn(async move {
-                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                    let cfg = { let cl = core.lock().await; cl.get_config_manager().lock().await.get_config_clone() };
-                    if let Some(al) = &cfg.auto_lobby {
-                        if al.enabled {
-                            let ln = match &al.lobby_name { Some(n) if !n.is_empty() => n.clone(), _ => { return; } };
-                            // Empty passwords are valid for passwordless auto-lobbies. Keep the
-                            // field present so the frontend can submit the same create/join flow.
-                            let lp = al.lobby_password.clone().unwrap_or_default();
-                            let pn = match &al.player_name { Some(n) if !n.is_empty() => n.clone(), _ => { return; } };
-                            info!("自动大厅：发送配置到前端");
-                            let _ = ah3.emit("auto-lobby-config", serde_json::json!({"lobbyName":ln,"lobbyPassword":lp,"playerName":pn,"useDomain":al.use_domain}));
-                        }
-                    }
                 });
             }
             Ok(())
@@ -1404,8 +1498,12 @@ pub fn run() {
                         }
 
                         // 正常退出流程
-                        if let Err(e) = core.lock().await.shutdown().await { error!("关闭错误: {}", e); }
-                        if let Some(w) = ah.get_webview_window("main") { let _ = w.close(); }
+                        if let Err(e) = core.lock().await.shutdown().await {
+                            error!("关闭错误: {}", e);
+                        }
+                        if let Some(w) = ah.get_webview_window("main") {
+                            let _ = w.close();
+                        }
                         ah.exit(0);
                     });
                 } else {

@@ -10,7 +10,13 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import top.pmh13.mctier.data.ChatPeerIdentity
 import top.pmh13.mctier.data.ChatSendRequest
 import top.pmh13.mctier.data.ChatWireMessage
+import top.pmh13.mctier.data.ChatAttachmentMeta
+import top.pmh13.mctier.data.ChatMaxAttachmentBytes
 import top.pmh13.mctier.data.MctierWireJson
+import top.pmh13.mctier.data.MctierJson
+import top.pmh13.mctier.data.validChatAttachment
+import java.io.ByteArrayOutputStream
+import java.io.File
 import java.util.Collections
 import java.util.LinkedHashSet
 import java.util.UUID
@@ -32,6 +38,7 @@ class ChatP2PClient(
     private val scope: CoroutineScope,
     private val bindIp: String,
     private val onMessage: (ChatWireMessage) -> Unit,
+    private val attachmentDirectory: File,
     injectedSigner: ChatAuth.ChatSigner? = null,
 ) {
     private val client = OkHttpClient.Builder()
@@ -40,7 +47,10 @@ class ChatP2PClient(
         .followRedirects(false)
         .followSslRedirects(false)
         .build()
-    private val server = ChatHttpServer(playerId, bindIp).also { it.onMessageReceived = { message -> accept(message) } }
+    private val server = ChatHttpServer(playerId, bindIp).also {
+        it.onMessageReceived = { message -> accept(message) }
+        it.encryptionSigner = { signingSigner() }
+    }
     private val seen = Collections.synchronizedSet(LinkedHashSet<String>())
 
     @Volatile private var peerIdentities: List<ChatPeerIdentity> = emptyList()
@@ -165,8 +175,57 @@ class ChatP2PClient(
     fun sendText(playerName: String, content: String, recipientId: String? = null): ChatWireMessage? =
         sendInternal(playerName, content, "text", null, recipientId)
 
-    fun sendImage(playerName: String, imageBytes: List<Int>, recipientId: String? = null): ChatWireMessage? =
-        sendInternal(playerName, "[Image]", "image", imageBytes, recipientId)
+    fun sendImage(playerName: String, imageBytes: List<Int>, recipientId: String? = null, content: String = "[Image]"): ChatWireMessage? =
+        sendInternal(playerName, content, "image", imageBytes, recipientId)
+
+    fun sendVoice(playerName: String, bytes: ByteArray, duration: Double, recipientId: String?): ChatWireMessage? =
+        sendInternal(playerName, org.json.JSONObject().put("mime", "audio/wav").put("duration", duration).toString(), "voice", bytes.map { it.toInt() and 255 }, recipientId)
+
+    fun sendFile(playerName: String, meta: ChatAttachmentMeta, file: File, recipientId: String?): ChatWireMessage? {
+        if (!validChatAttachment(meta) || !server.registerAttachment(meta, file, recipientId)) return null
+        val content = MctierJson.encodeToString(ChatAttachmentMeta.serializer(), meta)
+        return sendInternal(playerName, content, "file", null, recipientId)
+    }
+
+    fun acceptsFileMessages(): Boolean = true
+
+    fun fetchAttachment(ownerPlayerId: String, meta: ChatAttachmentMeta): File? {
+        if (!validChatAttachment(meta)) return null
+        if (ownerPlayerId == playerId) return server.localAttachment(meta)
+        val peer = peerIdentities.firstOrNull { it.playerId == ownerPlayerId } ?: return null
+        val key = peer.chatPublicKey ?: return null
+        val token = server.currentToken() ?: return null
+        val epoch = server.currentTokenEpoch().takeIf { it > 0 } ?: return null
+        val activeSigner = synchronized(signerLock) { signer } ?: return null
+        val path = "/api/chat/attachment/${meta.id}"
+        val signed = activeSigner.sign("GET", path, peer.virtualIp, epoch, ChatAuth.unixSeconds(), ByteArray(0), token) ?: return null
+        val request = Request.Builder().url("http://${formatHost(peer.virtualIp)}:14540$path")
+            .header(ChatTokenHeader, token).header(ChatAuth.KeyIdHeader, signed.keyId)
+            .header(ChatAuth.SignatureHeader, signed.signature).header(ChatAuth.TimestampHeader, signed.timestamp)
+            .header(ChatAuth.NonceHeader, signed.nonce).get().build()
+        val encrypted = runCatching { client.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) return null
+            val body = response.body ?: return null
+            if (body.contentLength() > MAX_ATTACHMENT_RESPONSE_BYTES) return null
+            val output = ByteArrayOutputStream()
+            body.byteStream().use { input ->
+                val buffer = ByteArray(16 * 1024)
+                while (true) {
+                    val count = input.read(buffer)
+                    if (count < 0) break
+                    if (output.size() + count > MAX_ATTACHMENT_RESPONSE_BYTES) return null
+                    output.write(buffer, 0, count)
+                }
+            }
+            output.toByteArray()
+        } }.getOrNull() ?: return null
+        val plain = runCatching { activeSigner.decrypt(key, token, path, encrypted) }.getOrNull() ?: return null
+        if (plain.size.toLong() != meta.size || plain.size > ChatMaxAttachmentBytes) return null
+        attachmentDirectory.mkdirs()
+        val extension = meta.name.substringAfterLast('.', "bin").takeIf { it.matches(Regex("[A-Za-z0-9]{1,16}")) } ?: "bin"
+        val target = File(attachmentDirectory, "${ownerPlayerId.replace(Regex("[^A-Za-z0-9]"), "_")}-${meta.id}.$extension")
+        return runCatching { target.writeBytes(plain); target }.getOrNull()
+    }
 
     fun sendAnnounce(playerName: String, text: String): ChatWireMessage? =
         sendInternal(playerName, text, "announce", null)
@@ -223,12 +282,14 @@ class ChatP2PClient(
      * is the destination peer's virtual IP, which stops that peer from relaying
      * this request to a third member as if freshly authored here.
      */
-    private fun postWithRetry(ip: String, body: ByteArray) {
+    private fun postWithRetry(ip: String, plain: ByteArray) {
         repeat(2) { attempt ->
             val token = server.currentToken() ?: return
             val epoch = server.currentTokenEpoch()
             if (epoch <= 0L) return
             val activeSigner = synchronized(signerLock) { signer } ?: return
+            val peer = peerIdentities.firstOrNull { it.virtualIp == ip }?.chatPublicKey ?: return
+            val body = runCatching { activeSigner.encrypt(peer, token, CHAT_SEND_PATH, plain) }.getOrNull() ?: return
             val signed = activeSigner.sign(
                 method = "POST",
                 path = CHAT_SEND_PATH,
@@ -281,5 +342,6 @@ class ChatP2PClient(
         private const val MAX_PEERS = 64
         private const val ChatTokenHeader = "x-mctier-chat-token"
         private const val CHAT_SEND_PATH = "/api/chat/send"
+        private const val MAX_ATTACHMENT_RESPONSE_BYTES = 90 * 1024 * 1024
     }
 }

@@ -36,7 +36,7 @@ pub struct AutoLobbyConfig {
     /// 大厅名称
     pub lobby_name: Option<String>,
     /// 大厅密码
-    #[serde(default, skip_serializing)]
+    #[serde(default)]
     pub lobby_password: Option<String>,
     /// 玩家名称
     pub player_name: Option<String>,
@@ -435,9 +435,15 @@ impl Default for UserConfig {
 impl UserConfig {
     fn migrate_legacy_signaling_server(&mut self) {
         let legacy = self.private_signaling_server.as_deref().map(str::trim);
-        if matches!(legacy.map(|url| url.trim_end_matches('/')),
-            Some("ws://test.pmhs.top" | "wss://test.pmhs.top" |
-                 "ws://test.pmhs.top/signaling" | "wss://test.pmhs.top/signaling")) {
+        if matches!(
+            legacy.map(|url| url.trim_end_matches('/')),
+            Some(
+                "ws://test.pmhs.top"
+                    | "wss://test.pmhs.top"
+                    | "ws://test.pmhs.top/signaling"
+                    | "wss://test.pmhs.top/signaling"
+            )
+        ) {
             self.private_signaling_server = Some("wss://mctier.pmhs.top/signaling".to_string());
         }
     }
@@ -564,7 +570,16 @@ impl ConfigManager {
         }
 
         // 序列化配置为 JSON（格式化输出，便于阅读）
-        let json_content = serde_json::to_string_pretty(&self.config)
+        let mut stored = self.config.clone();
+        if let Some(auto) = stored.auto_lobby.as_mut() {
+            if let Some(password) = auto.lobby_password.take() {
+                auto.lobby_password = Some(
+                    super::secret_store::protect_lobby_password(password)
+                        .map_err(AppError::ConfigError)?,
+                );
+            }
+        }
+        let json_content = serde_json::to_string_pretty(&stored)
             .map_err(|e| AppError::ConfigError(format!("序列化配置失败: {}", e)))?;
 
         // 写入文件（使用临时文件 + 原子重命名，防止写入过程中断导致文件损坏）
@@ -896,8 +911,18 @@ impl ConfigManager {
     /// * `Ok(())` - 导出成功
     /// * `Err(AppError)` - 导出失败
     pub async fn export_config(&self, export_path: PathBuf) -> Result<(), AppError> {
-        // 序列化配置为 JSON（格式化输出）
-        let json_content = serde_json::to_string_pretty(&self.config)
+        // Export the same protected representation that is written to disk;
+        // the in-memory config may still contain a legacy plaintext value.
+        let mut stored = self.config.clone();
+        if let Some(auto) = stored.auto_lobby.as_mut() {
+            if let Some(password) = auto.lobby_password.take() {
+                auto.lobby_password = Some(
+                    super::secret_store::protect_lobby_password(password)
+                        .map_err(AppError::ConfigError)?,
+                );
+            }
+        }
+        let json_content = serde_json::to_string_pretty(&stored)
             .map_err(|e| AppError::ConfigError(format!("序列化配置失败: {}", e)))?;
 
         // 写入文件
@@ -948,13 +973,26 @@ mod tests {
     #[test]
     fn legacy_signaling_defaults_migrate_without_replacing_custom_endpoints() {
         let mut config = UserConfig::default();
-        assert_eq!(config.private_signaling_server.as_deref(), Some("wss://mctier.pmhs.top/signaling"));
-        for old in ["wss://test.pmhs.top", "ws://test.pmhs.top/", "wss://test.pmhs.top/signaling"] {
+        assert_eq!(
+            config.private_signaling_server.as_deref(),
+            Some("wss://mctier.pmhs.top/signaling")
+        );
+        for old in [
+            "wss://test.pmhs.top",
+            "ws://test.pmhs.top/",
+            "wss://test.pmhs.top/signaling",
+        ] {
             config.private_signaling_server = Some(old.to_string());
             config.migrate_legacy_signaling_server();
-            assert_eq!(config.private_signaling_server.as_deref(), Some("wss://mctier.pmhs.top/signaling"));
+            assert_eq!(
+                config.private_signaling_server.as_deref(),
+                Some("wss://mctier.pmhs.top/signaling")
+            );
         }
-        for custom in ["wss://signal.example.com/private", "wss://test.pmhs.top/custom"] {
+        for custom in [
+            "wss://signal.example.com/private",
+            "wss://test.pmhs.top/custom",
+        ] {
             config.private_signaling_server = Some(custom.to_string());
             config.migrate_legacy_signaling_server();
             assert_eq!(config.private_signaling_server.as_deref(), Some(custom));

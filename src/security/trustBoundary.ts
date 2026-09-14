@@ -11,8 +11,8 @@ export const MAX_CHAT_TEXT_LENGTH = 10_000;
 export const MAX_ANNOUNCEMENT_LENGTH = 200;
 export const MAX_TODO_ITEMS = 200;
 export const MAX_TODO_TEXT_LENGTH = 200;
-export const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
-export const MAX_IMAGE_DATA_URL_LENGTH = 14 * 1024 * 1024;
+export const MAX_IMAGE_BYTES = 2 * 1024 * 1024;
+export const MAX_IMAGE_DATA_URL_LENGTH = 3 * 1024 * 1024;
 export const CHAT_TOKEN_LENGTH = 64;
 /** Uncompressed P-256 SubjectPublicKeyInfo DER is 91 bytes (~124 chars of
  * base64). The cap leaves room for encoder differences while still rejecting
@@ -125,7 +125,7 @@ export function isSafeSignalingServer(value: unknown): value is string {
   try {
     const parsed = new URL(trimmed);
     return (
-      (parsed.protocol === 'ws:' || parsed.protocol === 'wss:') &&
+        parsed.protocol === 'wss:' &&
       parsed.hostname.length > 0 &&
       !parsed.username &&
       !parsed.password &&

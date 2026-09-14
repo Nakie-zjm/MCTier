@@ -252,6 +252,39 @@ object ChatAuth {
         private val publicKeyDer: ByteArray,
         val keyId: String,
     ) {
+        private fun encryptionKey(peer: String, token: String): ByteArray {
+            val public = decodePublicKey(parsePublicKey(peer) ?: error("Invalid peer")) ?: error("Invalid peer key")
+            val agreement = javax.crypto.KeyAgreement.getInstance("ECDH")
+            agreement.init(privateKey)
+            agreement.doPhase(public, true)
+            val mac = javax.crypto.Mac.getInstance("HmacSHA256")
+            mac.init(javax.crypto.spec.SecretKeySpec(token.toByteArray(Charsets.UTF_8), "HmacSHA256"))
+            val prk = mac.doFinal(agreement.generateSecret())
+            mac.init(javax.crypto.spec.SecretKeySpec(prk, "HmacSHA256"))
+            return mac.doFinal("MCTier/chat-aead/v1".toByteArray(Charsets.UTF_8) + byteArrayOf(1))
+        }
+
+        fun encrypt(peer: String, token: String, path: String, body: ByteArray): ByteArray {
+            val iv = ByteArray(12).also(random::nextBytes)
+            val peerId = keyIdForPublicKey(parsePublicKey(peer) ?: error("Invalid peer"))
+            val cipher = javax.crypto.Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(javax.crypto.Cipher.ENCRYPT_MODE, javax.crypto.spec.SecretKeySpec(encryptionKey(peer, token), "AES"), javax.crypto.spec.GCMParameterSpec(128, iv))
+            cipher.updateAAD("MCTier/chat/v1\n$path\n$keyId\n$peerId".toByteArray(Charsets.UTF_8))
+            return org.json.JSONObject().put("v", 1).put("data", encodeBase64(iv + cipher.doFinal(body))).toString().toByteArray(Charsets.UTF_8)
+        }
+
+        fun decrypt(peer: String, token: String, path: String, body: ByteArray): ByteArray {
+            val envelope = org.json.JSONObject(body.toString(Charsets.UTF_8))
+            require(envelope.getInt("v") == 1)
+            val bytes = decodeBase64(envelope.getString("data")) ?: error("Invalid envelope")
+            require(bytes.size in 28..64 * 1024 * 1024 + 28)
+            val peerId = keyIdForPublicKey(parsePublicKey(peer) ?: error("Invalid peer"))
+            val cipher = javax.crypto.Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(javax.crypto.Cipher.DECRYPT_MODE, javax.crypto.spec.SecretKeySpec(encryptionKey(peer, token), "AES"), javax.crypto.spec.GCMParameterSpec(128, bytes.copyOfRange(0, 12)))
+            cipher.updateAAD("MCTier/chat/v1\n$path\n$peerId\n$keyId".toByteArray(Charsets.UTF_8))
+            return cipher.doFinal(bytes.copyOfRange(12, bytes.size))
+        }
+
         fun publicKeyBase64(): String = encodeBase64(publicKeyDer)
 
         fun identityId(): String = identityIdForPublicKey(publicKeyDer)

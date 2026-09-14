@@ -11,9 +11,10 @@ const val ChatServerPort = 14540
 const val ChatTokenHeader = "x-mctier-chat-token"
 const val ChatTokenHexLength = 64
 const val ChatMaxHistoryMessages = 1000
-const val ChatMaxHistoryBytes = 4 * 1024 * 1024
-const val ChatMaxHttpBodyBytes = 2 * 1024 * 1024
-const val AppClientVersion = "3.3.0"
+const val ChatMaxHistoryBytes = 12 * 1024 * 1024
+const val ChatMaxHttpBodyBytes = 12 * 1024 * 1024
+const val ChatMaxAttachmentBytes = 64 * 1024 * 1024
+const val AppClientVersion = "3.4.0"
 
 enum class AppConnectionState { Idle, Connecting, InLobby, Error }
 
@@ -73,6 +74,33 @@ data class ChatMessage(
     val imageBase64: String? = null, // data:image/jpeg;base64,... 用于显示
     val recalled: Boolean = false,
     val recipientId: String? = null,
+    val attachment: ChatAttachmentMeta? = null,
+    val attachmentPath: String? = null,
+)
+
+@Serializable
+data class ChatAttachmentMeta(
+    val id: String,
+    val name: String,
+    val mime: String,
+    val size: Long,
+)
+
+@Serializable
+data class EmojiCategory(
+    val id: String,
+    val name: String,
+    val builtin: Boolean = false,
+)
+
+@Serializable
+data class CustomEmojiItem(
+    val id: String,
+    val categoryId: String,
+    val name: String,
+    val mime: String,
+    val fileName: String,
+    val createdAt: Long,
 )
 
 @Serializable

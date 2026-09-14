@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "MCTier",
-  "version": "3.3.0",
+  "version": "3.4.0",
   "identifier": "com.mctier.app",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -70,13 +70,15 @@
           "http://ipc.localhost",
           "data:",
           "blob:",
+          "asset:",
+          "http://asset.localhost",
           "ws:",
           "wss:",
           "http://*:14540",
           "https://gitee.com"
         ],
         "frame-src": [
-          "'none'"
+          "'self'", "blob:", "asset:", "http://asset.localhost"
         ],
         "object-src": [
           "'none'"
@@ -137,11 +139,16 @@
           "http://ipc.localhost",
           "data:",
           "blob:",
+          "asset:",
+          "http://asset.localhost",
           "ws:",
           "wss:",
           "http://*:14540",
           "https://gitee.com",
           "http://localhost:1420"
+        ],
+        "frame-src": [
+          "'self'", "blob:", "asset:", "http://asset.localhost", "http://localhost:1420"
         ],
         "object-src": [
           "'none'"
@@ -152,7 +159,11 @@
       },
       "dangerousDisableAssetCspModification": [
         "style-src"
-      ]
+      ],
+      "assetProtocol": {
+        "enable": true,
+        "scope": ["$APPCACHE/emoji-builtin-v1/**", "$APPCACHE/chat-attachments/**"]
+      }
     },
     "withGlobalTauri": false
   },

@@ -1,7 +1,7 @@
 {
   "name": "mctier",
   "private": true,
-  "version": "3.3.0",
+  "version": "3.4.0",
   "description": "MCTier - Minecraft 虚拟局域网联机工具",
   "author": "MCTier Team",
   "type": "module",
@@ -28,6 +28,7 @@
     "dayjs": "^1.11.19",
     "framer-motion": "^11.15.0",
     "i18next": "^26.3.1",
+    "jszip": "^3.10.2",
     "qrcode": "^1.5.4",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",

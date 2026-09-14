@@ -100,10 +100,16 @@ pub async fn start_easytier(
         .port();
     let elevated = launch_elevated_helper(port)?;
     let stream = tokio::task::spawn_blocking(move || {
-        let result = super::helper_handshake::accept_authenticated(listener, elevated.pid, Duration::from_secs(10));
+        let result = super::helper_handshake::accept_authenticated(
+            listener,
+            elevated.pid,
+            Duration::from_secs(10),
+        );
         drop(elevated);
         result
-    }).await.map_err(|e| e.to_string())??;
+    })
+    .await
+    .map_err(|e| e.to_string())??;
     stream.set_nonblocking(true).map_err(|e| e.to_string())?;
     let stream = tokio::net::TcpStream::from_std(stream).map_err(|e| e.to_string())?;
 
@@ -154,10 +160,18 @@ pub fn run_one_shot(request: HelperRequest) -> Result<Option<String>, String> {
         .map_err(|e| format!("无法读取特权 helper 端口: {}", e))?
         .port();
     let elevated = launch_elevated_helper(port)?;
-    let stream = super::helper_handshake::accept_authenticated(listener, elevated.pid, Duration::from_secs(10))?;
+    let stream = super::helper_handshake::accept_authenticated(
+        listener,
+        elevated.pid,
+        Duration::from_secs(10),
+    )?;
     drop(elevated);
-    stream.set_read_timeout(Some(Duration::from_secs(10))).map_err(|e| e.to_string())?;
-    stream.set_write_timeout(Some(Duration::from_secs(10))).map_err(|e| e.to_string())?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .map_err(|e| e.to_string())?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(10)))
+        .map_err(|e| e.to_string())?;
     let mut reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
 
     let mut writer = BufWriter::new(stream);
@@ -219,8 +233,11 @@ struct ElevatedProcess {
 
 impl Drop for ElevatedProcess {
     fn drop(&mut self) {
-        let _ = unsafe { windows::Win32::Foundation::CloseHandle(
-            windows::Win32::Foundation::HANDLE(self.handle as *mut _)) };
+        let _ = unsafe {
+            windows::Win32::Foundation::CloseHandle(windows::Win32::Foundation::HANDLE(
+                self.handle as *mut _,
+            ))
+        };
     }
 }
 
@@ -264,7 +281,10 @@ fn launch_elevated_helper(port: u16) -> Result<ElevatedProcess, String> {
         let _ = unsafe { CloseHandle(info.hProcess) };
         return Err("无法读取特权 helper 进程 ID".into());
     }
-    Ok(ElevatedProcess { handle: info.hProcess.0 as isize, pid })
+    Ok(ElevatedProcess {
+        handle: info.hProcess.0 as isize,
+        pid,
+    })
 }
 
 pub fn run_if_requested() -> bool {
@@ -281,7 +301,9 @@ pub fn run_if_requested() -> bool {
         Some(pid) if pid != 0 => pid,
         _ => std::process::exit(2),
     };
-    if args.next().is_some() { std::process::exit(2); }
+    if args.next().is_some() {
+        std::process::exit(2);
+    }
     let result = helper_main(port, parent_pid);
     if let Err(error) = result {
         eprintln!("MCTier privileged helper failed: {}", error);
@@ -482,9 +504,7 @@ fn validate_runtime_location(executable_dir: &Path, working_dir: &Path) -> Resul
     let runtime = fs::canonicalize(parent)
         .map_err(|e| e.to_string())?
         .join(working_dir.file_name().ok_or("runtime 目录名称无效")?);
-    if runtime != install.join("runtime")
-        && runtime != install.join("resources").join("runtime")
-    {
+    if runtime != install.join("runtime") && runtime != install.join("resources").join("runtime") {
         return Err("EasyTier 运行路径不在受控 runtime 目录中".to_string());
     }
     Ok(())
@@ -501,23 +521,36 @@ mod runtime_path_tests {
         assert!(validate_runtime_location(install.path(), &canonical.join("runtime")).is_ok());
         assert!(validate_runtime_location(&canonical, &install.path().join("runtime")).is_ok());
         fs::create_dir(install.path().join("resources")).unwrap();
-        assert!(validate_runtime_location(install.path(), &canonical.join("resources/runtime")).is_ok());
+        assert!(
+            validate_runtime_location(install.path(), &canonical.join("resources/runtime")).is_ok()
+        );
     }
 
     #[test]
     fn rejects_siblings_and_external_runtime() {
         let install = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
-        assert!(validate_runtime_location(install.path(), &outside.path().join("runtime")).is_err());
-        assert!(validate_runtime_location(install.path(), &install.path().join("runtime-other")).is_err());
-        assert!(validate_runtime_location(install.path(), &install.path().join("../runtime")).is_err());
+        assert!(
+            validate_runtime_location(install.path(), &outside.path().join("runtime")).is_err()
+        );
+        assert!(
+            validate_runtime_location(install.path(), &install.path().join("runtime-other"))
+                .is_err()
+        );
+        assert!(
+            validate_runtime_location(install.path(), &install.path().join("../runtime")).is_err()
+        );
     }
 
     #[test]
     fn allows_passwordless_network_but_rejects_other_empty_arguments() {
         let config = Path::new(r"C:\MCTier\runtime\config_mctier-test");
-        let mut args = vec!["--network-secret".into(), String::new(),
-            "--config-dir".into(), config.to_string_lossy().into_owned()];
+        let mut args = vec![
+            "--network-secret".into(),
+            String::new(),
+            "--config-dir".into(),
+            config.to_string_lossy().into_owned(),
+        ];
         assert!(validate_start_args(&args, config).is_ok());
         args[0] = "--network-name".into();
         assert!(validate_start_args(&args, config).is_err());
@@ -588,14 +621,10 @@ fn validate_start_args(args: &[String], config_dir: &Path) -> Result<(), String>
     if args.is_empty() || args.len() > 256 {
         return Err("EasyTier 参数数量异常".to_string());
     }
-    if args
-        .iter()
-        .enumerate()
-        .any(|(index, arg)| {
-            let empty_secret = index > 0 && args[index - 1] == "--network-secret";
-            (arg.is_empty() && !empty_secret) || arg.len() > 64 * 1024 || arg.contains('\0')
-        })
-    {
+    if args.iter().enumerate().any(|(index, arg)| {
+        let empty_secret = index > 0 && args[index - 1] == "--network-secret";
+        (arg.is_empty() && !empty_secret) || arg.len() > 64 * 1024 || arg.contains('\0')
+    }) {
         return Err("EasyTier 参数包含非法内容".to_string());
     }
     let mut config_arg = None;
@@ -782,9 +811,12 @@ fn add_firewall_rules(easytier_path: &str) -> Result<String, String> {
             .output()
             .map_err(|e| format!("执行防火墙配置失败: {}", e))?;
         if !output.status.success() {
-            return Err(format!("防火墙规则 {} 配置失败: {} {}", rule.name,
+            return Err(format!(
+                "防火墙规则 {} 配置失败: {} {}",
+                rule.name,
                 String::from_utf8_lossy(&output.stdout).trim(),
-                String::from_utf8_lossy(&output.stderr).trim()));
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
         }
     }
     // Retain the old rules until every replacement is installed successfully.
@@ -798,14 +830,23 @@ fn add_firewall_rules(easytier_path: &str) -> Result<String, String> {
     if !check_firewall_rules()? {
         return Err("防火墙规则更新未完成，请重新运行网络诊断中的防火墙修复".into());
     }
-    Ok(format!("已添加 {} 条防火墙放行规则", firewall_policy::RULE_NAMES.len()))
+    Ok(format!(
+        "已添加 {} 条防火墙放行规则",
+        firewall_policy::RULE_NAMES.len()
+    ))
 }
 
 fn check_firewall_rules() -> Result<bool, String> {
     use super::firewall_policy;
     let netsh = windows_paths::system_command("netsh.exe");
-    for (rule, should_exist) in firewall_policy::RULE_NAMES.into_iter().map(|rule| (rule, true))
-        .chain(firewall_policy::LEGACY_RULES.into_iter().map(|rule| (rule, false)))
+    for (rule, should_exist) in firewall_policy::RULE_NAMES
+        .into_iter()
+        .map(|rule| (rule, true))
+        .chain(
+            firewall_policy::LEGACY_RULES
+                .into_iter()
+                .map(|rule| (rule, false)),
+        )
     {
         let output = Command::new(&netsh)
             .args(["advfirewall", "firewall", "show", "rule"])
@@ -893,5 +934,3 @@ fn is_elevated() -> bool {
             && elevation.TokenIsElevated != 0
     }
 }
-
-

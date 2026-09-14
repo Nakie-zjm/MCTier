@@ -18,6 +18,7 @@ import { statsService } from '../../services/stats/statsService';
 import { PublicPlaza } from '../PublicPlaza/PublicPlaza';
 import type { PublicLobby } from '../../services/lobby/publicLobbies';
 import { parseLobbyInviteText, type LobbyInvite } from '../../services/lobby/lobbyInvite';
+import { isProtectedPassword, protectLobbyPassword } from '../../security/lobbyPassword';
 import { selectSavedLobbyPlayerName } from '../../services/lobby/savedLobbyIdentity';
 import {
   lobbySessionCoordinator,
@@ -578,9 +579,9 @@ export const LobbyForm: React.FC<LobbyFormProps> = ({ mode, onClose }) => {
   }, [i18n.language, customNodes]);
 
   // 一键随机生成大厅名称和密码
-  const handleRandomGenerate = () => {
+  const handleRandomGenerate = async () => {
     const lobbyName = generateRandomLobbyName();
-    const password = generateRandomPassword();
+    const password = await protectLobbyPassword(generateRandomPassword());
 
     form.setFieldsValue({
       lobbyName,
@@ -590,9 +591,12 @@ export const LobbyForm: React.FC<LobbyFormProps> = ({ mode, onClose }) => {
     message.success(tl('已随机生成大厅名称和密码', 'Random lobby name and password generated'));
   };
 
-  const applyImportedLobby = (
+  const applyImportedLobby = async (
     invite: LobbyInvite & { playerName?: string; useDomain?: boolean }
   ) => {
+    let password: string;
+    try { password = await protectLobbyPassword(invite.password); }
+    catch { message.error(tl('无法读取加密密码，请检查系统凭据库或重新获取邀请', 'Cannot read encrypted password. Check system credentials or request a new invite')); return; }
     const rawServerNode = invite.serverNode?.trim() || undefined;
     const legacyCustomSentinel = rawServerNode === 'custom';
     const serverNode = legacyCustomSentinel
@@ -610,7 +614,7 @@ export const LobbyForm: React.FC<LobbyFormProps> = ({ mode, onClose }) => {
     setShowCustomServer(legacyCustomSentinel ? true : false);
     form.setFieldsValue({
       lobbyName: invite.name,
-      password: invite.password,
+      password,
       playerName: invite.playerName || config.playerName || '',
       useDomain: invite.useDomain ?? false,
       ...(legacyCustomSentinel ? { serverNode: 'custom' } : serverNode ? { serverNode } : {}),
@@ -621,7 +625,7 @@ export const LobbyForm: React.FC<LobbyFormProps> = ({ mode, onClose }) => {
   const handleSelectFavorite = (lobby: FavoriteLobby) => {
     applyImportedLobby({
       name: lobby.name,
-      password: '',
+      password: lobby.password || '',
       playerName: selectSavedLobbyPlayerName(form.getFieldValue('playerName'), lobby.playerName, config.playerName),
       useDomain: lobby.useDomain,
       serverNode: lobby.serverNode,
@@ -633,7 +637,7 @@ export const LobbyForm: React.FC<LobbyFormProps> = ({ mode, onClose }) => {
   const handleSelectRecent = (lobby: RecentLobby) => {
     applyImportedLobby({
       name: lobby.name,
-      password: '',
+      password: lobby.password || '',
       playerName: selectSavedLobbyPlayerName(form.getFieldValue('playerName'), lobby.playerName, config.playerName),
       useDomain: lobby.useDomain,
       serverNode: lobby.serverNode,
@@ -747,12 +751,14 @@ export const LobbyForm: React.FC<LobbyFormProps> = ({ mode, onClose }) => {
   }, []);
 
   // 检测自动大厅配置，自动填充并提交
+  const pendingAutoConfig = useRef<any>(null);
   useEffect(() => {
-    const autoConfig = (window as any).__autoLobbyConfig;
+    const autoConfig = (window as any).__autoLobbyConfig || pendingAutoConfig.current;
     // 没有配置或不是创建模式就跳过
     if (!autoConfig || mode !== 'create') return;
     // 立即清除，防止重复触发
     delete (window as any).__autoLobbyConfig;
+    pendingAutoConfig.current = autoConfig;
     const { lobbyName, lobbyPassword, playerName, useDomain } = autoConfig;
     form.setFieldsValue({
       lobbyName,
@@ -761,9 +767,11 @@ export const LobbyForm: React.FC<LobbyFormProps> = ({ mode, onClose }) => {
       useDomain: useDomain || false,
       serverNode: resolvedPreferredServer,
     });
-    setTimeout(() => {
+    const timer = setTimeout(() => {
+      pendingAutoConfig.current = null;
       form.submit();
     }, 300);
+    return () => clearTimeout(timer);
   }, [form, mode, config.preferredServer]);
 
   // 检测邀请 deep link 预填（仅填表，不自动提交）
@@ -803,7 +811,7 @@ export const LobbyForm: React.FC<LobbyFormProps> = ({ mode, onClose }) => {
         invite.name.length >= 4 &&
         (invite.password.length === 0 || invite.password.length >= 8)
       ) {
-        applyImportedLobby(invite);
+        await applyImportedLobby(invite);
         message.success(
           invite.serverNode
             ? tl(
@@ -900,7 +908,10 @@ export const LobbyForm: React.FC<LobbyFormProps> = ({ mode, onClose }) => {
     }
   };
 
+  const submissionInFlight = useRef(false);
   const handleSubmit = async (values: LobbyFormValues, overrideNode?: string) => {
+    if (submissionInFlight.current) return;
+    submissionInFlight.current = true;
     // 记录本次实际尝试的节点选择，便于失败时提供「换节点重试」
     const failedNodeValue = overrideNode ?? values.serverNode;
     let sessionTicket: LobbySessionTicket | null = null;
@@ -979,7 +990,7 @@ export const LobbyForm: React.FC<LobbyFormProps> = ({ mode, onClose }) => {
       if (invalidNode || invalidSignaling) {
         const detail = invalidNode
           ? tl('EasyTier 节点地址无效，请重新选择节点或检查自定义节点地址', 'Invalid EasyTier node address. Select a node or check the custom address.')
-          : tl('信令服务器地址无效，请检查私有服务器或邀请中的 ws://、wss:// 地址', 'Invalid signaling address. Check the ws:// or wss:// address in private settings or the invitation.');
+          : tl('信令服务器地址无效，必须使用 wss:// 加密连接', 'Invalid signaling address. An encrypted wss:// connection is required.');
         setSubmitError(detail);
         message.error(detail);
         // Diagnose configuration/engine differences without recording endpoints,
@@ -1083,8 +1094,9 @@ export const LobbyForm: React.FC<LobbyFormProps> = ({ mode, onClose }) => {
 
       // 记录到"最近大厅"，便于下次快速重进
       try {
-        recentService.recordLobby({
+        await recentService.recordLobby({
           name: values.lobbyName.trim(),
+          password: lobby.password || '',
           playerName: values.playerName.trim(),
           useDomain: values.useDomain === true,
           serverNode,
@@ -1322,6 +1334,7 @@ export const LobbyForm: React.FC<LobbyFormProps> = ({ mode, onClose }) => {
         }
       }
     } finally {
+      submissionInFlight.current = false;
       const currentSession = lobbySessionCoordinator.current();
       if (
         !sessionTicket ||
@@ -1532,6 +1545,7 @@ export const LobbyForm: React.FC<LobbyFormProps> = ({ mode, onClose }) => {
                 },
                 {
                   validator: (_, value) => {
+                    if (isProtectedPassword(value)) return Promise.resolve();
                     if (!value) return Promise.resolve();
                     const hasAlphanumeric = /[a-zA-Z0-9\u4e00-\u9fa5]/.test(value);
                     if (!hasAlphanumeric) {
@@ -1573,6 +1587,10 @@ export const LobbyForm: React.FC<LobbyFormProps> = ({ mode, onClose }) => {
                 {
                   validator: (_, value) => {
                     if (!value) return Promise.resolve();
+                    // Protected local/invite envelopes are opaque UI values. Their
+                    // ciphertext length is unrelated to the plaintext policy;
+                    // the Tauri command resolves and validates them at the boundary.
+                    if (isProtectedPassword(value)) return Promise.resolve();
                     if (value.trim() !== value || value.length < 8 || value.length > 32) {
                       return Promise.reject(
                         new Error(
@@ -1735,10 +1753,10 @@ export const LobbyForm: React.FC<LobbyFormProps> = ({ mode, onClose }) => {
                       ),
                     },
                     {
-                      pattern: /^wss?:\/\/.+$/,
+                      pattern: /^wss:\/\/.+$/,
                       message: tl(
-                        '格式：ws://域名/path 或 wss://域名/path',
-                        'Format: ws://host/path or wss://host/path'
+                        '格式：wss://域名/path',
+                        'Format: wss://host/path'
                       ),
                     },
                   ]}

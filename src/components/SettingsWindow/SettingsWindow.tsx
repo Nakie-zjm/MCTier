@@ -319,9 +319,9 @@ export const SettingsWindow: React.FC<{ onClose: () => void }> = ({ onClose }) =
       await invoke('save_settings', {
         autoStartup: merged.autoStartup ?? false,
         language: merged.language ?? 'system',
-        autoLobbyEnabled: merged.autoLobbyEnabled ?? false,
+        autoLobbyEnabled: patch?.autoLobbyEnabled ?? null,
         lobbyName: merged.lobbyName || null,
-        lobbyPassword: merged.lobbyPassword || null,
+        lobbyPassword: merged.lobbyPassword ?? null,
         playerName: merged.playerName || null,
         useDomain: merged.useDomain ?? false,
         virtualDomain: merged.virtualDomain || null,
@@ -674,9 +674,7 @@ export const SettingsWindow: React.FC<{ onClose: () => void }> = ({ onClose }) =
                       </Form.Item>
                       <Form.Item name="lobbyPassword" label={tl('大厅密码', 'Lobby Password')}
                         rules={[
-                          { required: true, message: tl('请输入密码', 'Please enter a password') },
-                          { min: 8, max: 32, message: tl('长度 8-32 个字符', 'Length must be 8-32 characters') },
-                          { validator: (_, v) => { if (!v) return Promise.resolve(); if (!/[a-zA-Z]/.test(v)) return Promise.reject(new Error(tl('必须含字母', 'Must contain letters'))); if (!/[0-9]/.test(v)) return Promise.reject(new Error(tl('必须含数字', 'Must contain digits'))); return Promise.resolve(); } },
+                          { validator: (_, v) => { if (!v || v.startsWith('mctier-local-v1:')) return Promise.resolve(); if (v.length < 8 || v.length > 32 || !/[a-zA-Z]/.test(v) || !/[0-9]/.test(v)) return Promise.reject(new Error(tl('密码必须为8-32位且含字母和数字', 'Use 8-32 characters with letters and digits'))); return Promise.resolve(); } },
                         ]}>
                         <PasswordInput placeholder={tl('8-32 个字符，含字母和数字', '8-32 characters with letters and digits')} maxLength={32} onBlur={handleFieldBlur} />
                       </Form.Item>
@@ -759,7 +757,7 @@ export const SettingsWindow: React.FC<{ onClose: () => void }> = ({ onClose }) =
                       <Form.Item name="privateSignalingServer" label={tl('WebRTC 信令服务器', 'WebRTC Signaling Server')}
                         rules={[
                           { required: true, message: tl('请输入信令服务器地址', 'Please enter the signaling server address') },
-                          { pattern: /^wss?:\/\/.+$/, message: tl('格式：ws://域名/path 或 wss://域名/path', 'Format: ws://host/path or wss://host/path') },
+                          { pattern: /^wss:\/\/.+$/, message: tl('格式：wss://域名/path', 'Format: wss://host/path') },
                         ]}>
                         <Input placeholder="wss://mctier.pmhs.top/signaling" onBlur={handleFieldBlur} />
                       </Form.Item>
@@ -1259,7 +1257,7 @@ const CustomNodeManager: React.FC = () => {
       await invoke('save_settings', {
         language: cur.language ?? 'system',
         autoStartup: cur.autoStartup ?? false,
-        autoLobbyEnabled: cur.autoLobbyEnabled ?? false,
+        autoLobbyEnabled: null,
         lobbyName: cur.lobbyName ?? null,
         lobbyPassword: cur.lobbyPassword ?? null,
         playerName: cur.playerName ?? null,
@@ -1612,7 +1610,7 @@ const CommunityNodeManager: React.FC = () => {
       await invoke('save_settings', {
         language: cur.language ?? 'system',
         autoStartup: cur.autoStartup ?? false,
-        autoLobbyEnabled: cur.autoLobbyEnabled ?? false,
+        autoLobbyEnabled: null,
         lobbyName: cur.lobbyName ?? null,
         lobbyPassword: cur.lobbyPassword ?? null,
         playerName: cur.playerName ?? null,

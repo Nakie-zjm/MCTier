@@ -28,14 +28,27 @@ const MAX_REMOTE_BATCH_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_REMOTE_BATCH_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_PATH_GRANTS: usize = 4096;
 const MAX_CHAT_TARGETS: usize = 64;
-const MAX_CHAT_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_CHAT_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_CHAT_ATTACHMENT_RESPONSE_BYTES: usize = 90 * 1024 * 1024;
+fn require_secure_signaling(value: &str) -> Result<(), String> {
+    let url = reqwest::Url::parse(value).map_err(|_| "Invalid signaling URL")?;
+    if url.scheme() != "wss"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return Err("信令服务器必须使用 WSS 加密连接".into());
+    }
+    Ok(())
+}
 // 仅 Windows 凭据管理器路径使用；其他平台不落盘明文密码，因此这里不是死代码，
 // 而是平台无关声明配平台相关使用。
 #[cfg(windows)]
 const AUTO_LOBBY_CREDENTIAL_TARGET: &str = "MCTier:auto-lobby-password";
 
 #[cfg(windows)]
-fn read_auto_lobby_secret() -> Option<String> {
+fn read_auto_lobby_secret() -> Result<Option<String>, String> {
     use windows::core::PCWSTR;
     use windows::Win32::Security::Credentials::{
         CredFree, CredReadW, CREDENTIALW, CRED_TYPE_GENERIC,
@@ -47,19 +60,24 @@ fn read_auto_lobby_secret() -> Option<String> {
         .collect::<Vec<_>>();
     let mut credential: *mut CREDENTIALW = std::ptr::null_mut();
     unsafe {
-        CredReadW(
+        if let Err(error) = CredReadW(
             PCWSTR(target.as_ptr()),
             CRED_TYPE_GENERIC,
             0,
             &mut credential,
-        )
-        .ok()?;
-        let record = credential.as_ref()?;
+        ) {
+            if error.code() == windows::core::HRESULT::from_win32(1168) {
+                return Ok(None);
+            }
+            return Err("无法读取 Windows 凭据库".into());
+        }
+        let record = credential.as_ref().ok_or("Invalid credential record")?;
         let bytes =
             std::slice::from_raw_parts(record.CredentialBlob, record.CredentialBlobSize as usize);
-        let value = String::from_utf8(bytes.to_vec()).ok();
+        let value = String::from_utf8(bytes.to_vec());
         CredFree(credential.cast());
-        value.filter(|password| !password.is_empty())
+        let value = value.map_err(|_| "Invalid credential encoding")?;
+        Ok((!value.is_empty()).then_some(value))
     }
 }
 
@@ -96,25 +114,30 @@ fn write_auto_lobby_secret(password: &str) -> Result<(), String> {
 }
 
 #[cfg(not(windows))]
-fn auto_lobby_session_secret() -> &'static StdMutex<Option<String>> {
-    static SECRET: OnceLock<StdMutex<Option<String>>> = OnceLock::new();
-    SECRET.get_or_init(|| StdMutex::new(None))
-}
-
-#[cfg(not(windows))]
-fn read_auto_lobby_secret() -> Option<String> {
-    auto_lobby_session_secret()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone()
+fn read_auto_lobby_secret() -> Result<Option<String>, String> {
+    let entry = keyring::Entry::new("MCTier", "auto-lobby-password")
+        .map_err(|_| "System credential store unavailable")?;
+    match entry.get_password() {
+        Ok(value) => Ok(Some(value)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(_) => Err("Cannot read system credential".into()),
+    }
 }
 
 #[cfg(not(windows))]
 fn write_auto_lobby_secret(password: &str) -> Result<(), String> {
-    *auto_lobby_session_secret()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-        (!password.is_empty()).then(|| password.to_string());
+    let entry = keyring::Entry::new("MCTier", "auto-lobby-password")
+        .map_err(|_| "System credential store unavailable")?;
+    if password.is_empty() {
+        match entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => {}
+            Err(_) => return Err("Cannot remove saved password".into()),
+        }
+    } else {
+        entry
+            .set_password(password)
+            .map_err(|_| "Cannot save system credential")?;
+    }
     Ok(())
 }
 
@@ -439,6 +462,52 @@ fn unix_system_command(name: &str) -> Result<std::path::PathBuf, String> {
         .ok_or_else(|| format!("找不到系统命令: {}", name))
 }
 
+/// Open a user-supplied web URL with the operating system's default browser.
+/// Chat links are deliberately handled here instead of through the shell
+/// plugin's fixed-domain allowlist: the URL is parsed and constrained to HTTP(S)
+/// before it reaches a platform launcher.
+#[tauri::command]
+pub fn open_external_url(url: String) -> Result<(), String> {
+    if url.len() > 8192 || url.chars().any(|character| character.is_control()) {
+        return Err("链接格式无效".into());
+    }
+    let parsed = reqwest::Url::parse(url.trim()).map_err(|_| "链接格式无效")?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return Err("仅支持不带账号信息的 HTTP(S) 链接".into());
+    }
+
+    #[cfg(windows)]
+    {
+        std::process::Command::new(windows_system_command("explorer.exe"))
+            .arg(parsed.as_str())
+            .spawn()
+            .map_err(|error| format!("无法打开系统浏览器: {error}"))?;
+        return Ok(());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new(unix_system_command("open")?)
+            .arg(parsed.as_str())
+            .spawn()
+            .map_err(|error| format!("无法打开系统浏览器: {error}"))?;
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new(unix_system_command("xdg-open")?)
+            .arg(parsed.as_str())
+            .spawn()
+            .map_err(|error| format!("无法打开系统浏览器: {error}"))?;
+        return Ok(());
+    }
+    #[allow(unreachable_code)]
+    Err("当前系统不支持打开外部链接".into())
+}
+
 /// 应用状态包装器（用于 Tauri State）
 pub struct AppState {
     pub core: Arc<Mutex<AppCore>>,
@@ -471,6 +540,8 @@ pub async fn create_lobby(
     app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Lobby, String> {
+    let password = super::secret_store::resolve(&password)?;
+    require_secure_signaling(&signaling_server)?;
     log::info!(
         "收到创建大厅命令: name={}, player={}, player_id={}, signaling_server={}, use_domain={:?}",
         name,
@@ -482,6 +553,14 @@ pub async fn create_lobby(
 
     let core = state.core.lock().await;
 
+    // Claim the transition while holding core: overlapping requests must not
+    // overwrite state or roll back a session owned by another request.
+    if matches!(
+        core.get_state().await,
+        CoreAppState::Connecting | CoreAppState::InLobby
+    ) {
+        return Err("大厅正在连接或已连接，请先退出当前大厅".to_string());
+    }
     // 更新应用状态为连接中
     core.set_state(CoreAppState::Connecting).await;
 
@@ -559,6 +638,8 @@ pub async fn create_lobby(
                 Err(e) => {
                     log::error!("❌ 启动P2P信令服务失败（创建大厅）: {}", e);
                     drop(p2p_svc);
+                    lobby_manager.lock().await.force_clear_state();
+                    let _ = network_service.lock().await.stop_easytier().await;
                     let core = state.core.lock().await;
                     core.set_state(CoreAppState::Error(format!("P2P信令服务启动失败: {}", e)))
                         .await;
@@ -595,10 +676,23 @@ pub async fn create_lobby(
             // LobbyManager may already contain a lobby when the later P2P
             // signaling step fails; leaving either behind makes the next
             // click fail immediately with AlreadyInLobby.
+            if matches!(e, crate::modules::lobby_manager::LobbyError::AlreadyInLobby) {
+                drop(lobby_mgr);
+                drop(network_svc);
+                state
+                    .core
+                    .lock()
+                    .await
+                    .set_state(CoreAppState::InLobby)
+                    .await;
+                return Err(e.to_string());
+            }
             lobby_mgr.force_clear_state();
             let _ = network_svc.stop_easytier().await;
 
             // 更新应用状态为错误
+            drop(lobby_mgr);
+            drop(network_svc);
             let core = state.core.lock().await;
             core.set_state(CoreAppState::Error(e.to_string())).await;
             drop(core);
@@ -633,6 +727,8 @@ pub async fn join_lobby(
     app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Lobby, String> {
+    let password = super::secret_store::resolve(&password)?;
+    require_secure_signaling(&signaling_server)?;
     log::info!(
         "收到加入大厅命令: name={}, player={}, player_id={}, signaling_server={}, use_domain={:?}",
         name,
@@ -644,6 +740,12 @@ pub async fn join_lobby(
 
     let core = state.core.lock().await;
 
+    if matches!(
+        core.get_state().await,
+        CoreAppState::Connecting | CoreAppState::InLobby
+    ) {
+        return Err("大厅正在连接或已连接，请先退出当前大厅".to_string());
+    }
     // 更新应用状态为连接中
     core.set_state(CoreAppState::Connecting).await;
 
@@ -724,6 +826,8 @@ pub async fn join_lobby(
                     log::error!("❌ 启动P2P信令服务失败（加入大厅）: {}", e);
                     // P2P信令服务启动失败应该返回错误，因为没有它就无法发现其他玩家
                     drop(p2p_svc);
+                    lobby_manager.lock().await.force_clear_state();
+                    let _ = network_service.lock().await.stop_easytier().await;
                     let core = state.core.lock().await;
                     core.set_state(CoreAppState::Error(format!("P2P信令服务启动失败: {}", e)))
                         .await;
@@ -758,10 +862,23 @@ pub async fn join_lobby(
 
             // Roll back partial setup so a failed join can be retried without
             // requiring an application restart or a separate force-stop.
+            if matches!(e, crate::modules::lobby_manager::LobbyError::AlreadyInLobby) {
+                drop(lobby_mgr);
+                drop(network_svc);
+                state
+                    .core
+                    .lock()
+                    .await
+                    .set_state(CoreAppState::InLobby)
+                    .await;
+                return Err(e.to_string());
+            }
             lobby_mgr.force_clear_state();
             let _ = network_svc.stop_easytier().await;
 
             // 更新应用状态为错误
+            drop(lobby_mgr);
+            drop(network_svc);
             let core = state.core.lock().await;
             core.set_state(CoreAppState::Error(e.to_string())).await;
             drop(core);
@@ -1030,9 +1147,14 @@ pub async fn get_config(state: State<'_, AppState>) -> Result<UserConfig, String
     let config_manager = core.get_config_manager();
     let config_mgr = config_manager.lock().await;
 
-    let config = config_mgr.get_config_clone();
-
-    log::debug!("返回配置: {:?}", config);
+    let mut config = config_mgr.get_config_clone();
+    if let Some(auto) = config.auto_lobby.as_mut() {
+        auto.lobby_password = auto
+            .lobby_password
+            .take()
+            .map(super::secret_store::protect_lobby_password)
+            .transpose()?;
+    }
 
     Ok(config)
 }
@@ -1046,7 +1168,17 @@ pub async fn get_config(state: State<'_, AppState>) -> Result<UserConfig, String
 /// * `Ok(())` - 更新成功
 /// * `Err(String)` - 错误信息
 #[tauri::command]
-pub async fn update_config(config: UserConfig, state: State<'_, AppState>) -> Result<(), String> {
+pub async fn update_config(
+    mut config: UserConfig,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    if let Some(auto) = config.auto_lobby.as_mut() {
+        auto.lobby_password = auto
+            .lobby_password
+            .take()
+            .map(super::secret_store::protect_lobby_password)
+            .transpose()?;
+    }
     log::info!("收到更新配置命令");
 
     let core = state.core.lock().await;
@@ -1866,7 +1998,7 @@ pub async fn check_firewall_rules() -> Result<bool, String> {
 
         log::info!("防火墙规则检查结果: {}", has_rules);
         Ok(has_rules)
-        }
+    }
 
     #[cfg(target_os = "linux")]
     {
@@ -1930,7 +2062,7 @@ pub async fn add_firewall_rules(app_handle: tauri::AppHandle) -> Result<String, 
             },
         )?;
         Ok(value.unwrap_or_else(|| "防火墙规则已更新".to_string()))
-        }
+    }
     #[cfg(target_os = "linux")]
     {
         let _ = app_handle;
@@ -4896,10 +5028,26 @@ pub async fn save_chat_image(image_data: String) -> Result<String, String> {
 
     log::info!("保存聊天图片，数据长度: {} bytes", image_data.len());
 
-    // 解码Base64数据
+    if image_data.len() > 14 * 1024 * 1024 {
+        return Err("图片大小超出限制".to_string());
+    }
     let bytes = general_purpose::STANDARD
         .decode(&image_data)
         .map_err(|e| format!("Base64解码失败: {}", e))?;
+    if bytes.is_empty() || bytes.len() > 10 * 1024 * 1024 {
+        return Err("图片大小超出限制".to_string());
+    }
+    let extension = if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        "gif"
+    } else if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]) {
+        "png"
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        "jpg"
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        "webp"
+    } else {
+        return Err("不支持的图片格式".to_string());
+    };
 
     log::info!("解码后图片大小: {} bytes", bytes.len());
 
@@ -4911,7 +5059,7 @@ pub async fn save_chat_image(image_data: String) -> Result<String, String> {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis();
-    let filename = format!("MCTier_聊天图片_{}.png", timestamp);
+    let filename = format!("MCTier_聊天图片_{}.{}", timestamp, extension);
 
     // 构建完整路径
     let file_path = download_dir.join(filename);
@@ -4965,11 +5113,12 @@ use crate::modules::chat_auth::{
     CHAT_TIMESTAMP_HEADER,
 };
 use crate::modules::chat_service::{
-    is_message_id_for_player, ChatMessage as ChatServiceMessage, ChatPeerIdentity, MessageType,
-    SendMessageRequest, CHAT_TOKEN_HEADER, MAX_ANNOUNCE_BYTES, MAX_AVATAR_BYTES,
-    MAX_CLIPBOARD_BYTES, MAX_HISTORY_MESSAGES, MAX_IMAGE_BYTES, MAX_IMAGE_CONTENT_BYTES,
-    MAX_RECALL_BYTES, MAX_TEXT_BYTES, MAX_TODO_BYTES, MAX_VOICE_GROUP_BYTES, MAX_WHITEBOARD_BYTES,
-    RECALL_WINDOW_SECS,
+    is_message_id_for_player, valid_attachment_meta, ChatAttachmentMeta,
+    ChatMessage as ChatServiceMessage, ChatPeerIdentity, MessageType, SendMessageRequest,
+    CHAT_TOKEN_HEADER, MAX_ANNOUNCE_BYTES, MAX_AVATAR_BYTES, MAX_CHAT_ATTACHMENT_BYTES,
+    MAX_CLIPBOARD_BYTES, MAX_FILE_CONTENT_BYTES, MAX_HISTORY_MESSAGES, MAX_IMAGE_BYTES,
+    MAX_IMAGE_CONTENT_BYTES, MAX_RECALL_BYTES, MAX_TEXT_BYTES, MAX_TODO_BYTES,
+    MAX_VOICE_GROUP_BYTES, MAX_WHITEBOARD_BYTES, RECALL_WINDOW_SECS,
 };
 
 /// Attach the per-member signature material to an outgoing chat request.
@@ -5018,6 +5167,23 @@ fn validate_outgoing_chat_payload(
 ) -> Result<(), String> {
     let content_bytes = content.as_bytes().len();
     match message_type {
+        MessageType::Voice => {
+            if !super::chat_service::valid_voice_payload(content, image_data.map(|v| v.as_slice()))
+            {
+                return Err("语音消息格式或时长无效".into());
+            }
+        }
+        MessageType::File => {
+            if content_bytes == 0 || content_bytes > MAX_FILE_CONTENT_BYTES || image_data.is_some()
+            {
+                return Err("文件消息元数据无效".to_string());
+            }
+            let meta: ChatAttachmentMeta =
+                serde_json::from_str(content).map_err(|_| "文件消息元数据无法解析".to_string())?;
+            if !valid_attachment_meta(&meta) {
+                return Err("文件消息元数据无效".to_string());
+            }
+        }
         MessageType::Text => {
             if content_bytes == 0 || content_bytes > MAX_TEXT_BYTES || image_data.is_some() {
                 return Err("文本消息为空、过长或包含多余图片数据".to_string());
@@ -5292,6 +5458,417 @@ pub async fn stop_p2p_chat(
     Ok(())
 }
 
+fn chat_file_mime(name: &str) -> String {
+    let extension = std::path::Path::new(name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "mp3" => "audio/mpeg",
+        "m4a" | "aac" => "audio/mp4",
+        "wav" => "audio/wav",
+        "ogg" | "oga" | "opus" => "audio/ogg",
+        "flac" => "audio/flac",
+        "mp4" | "m4v" => "video/mp4",
+        "webm" => "video/webm",
+        "mov" => "video/quicktime",
+        "mkv" => "video/x-matroska",
+        "avi" => "video/x-msvideo",
+        "pdf" => "application/pdf",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "doc" => "application/msword",
+        "xls" => "application/vnd.ms-excel",
+        "ppt" => "application/vnd.ms-powerpoint",
+        "txt" | "log" | "ini" | "conf" => "text/plain",
+        "md" => "text/markdown",
+        "csv" => "text/csv",
+        "json" => "application/json",
+        "xml" => "application/xml",
+        "html" | "htm" => "text/html",
+        "js" | "ts" | "jsx" | "tsx" | "css" | "rs" | "kt" | "java" | "py" | "go" | "c" | "h"
+        | "cpp" | "hpp" | "toml" | "yaml" | "yml" => "text/plain",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "bmp" => "image/bmp",
+        "ico" => "image/x-icon",
+        "zip" => "application/zip",
+        "7z" => "application/x-7z-compressed",
+        "rar" => "application/vnd.rar",
+        _ => "application/octet-stream",
+    }
+    .to_string()
+}
+
+fn safe_chat_file_name(path: &std::path::Path) -> Result<String, String> {
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or("文件名无效")?;
+    let name = name.trim();
+    if name.is_empty()
+        || name.chars().count() > 180
+        || name
+            .chars()
+            .any(|ch| ch.is_control() || matches!(ch, '/' | '\\' | ':'))
+    {
+        return Err("文件名包含不安全字符或过长".to_string());
+    }
+    Ok(name.to_string())
+}
+
+#[tauri::command]
+pub async fn select_chat_attachment(
+    recipient_id: Option<String>,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Option<ChatAttachmentMeta>, String> {
+    let Some(source) = rfd::FileDialog::new().set_title("发送文件").pick_file() else {
+        return Ok(None);
+    };
+    let source_meta =
+        std::fs::symlink_metadata(&source).map_err(|error| format!("读取文件失败: {error}"))?;
+    if !source_meta.is_file()
+        || source_meta.file_type().is_symlink()
+        || source_meta.len() == 0
+        || source_meta.len() > MAX_CHAT_ATTACHMENT_BYTES
+    {
+        return Err("仅支持 1 B 至 64 MiB 的普通文件".to_string());
+    }
+    let name = safe_chat_file_name(&source)?;
+    let id = format!("att-{}", uuid::Uuid::new_v4());
+    let meta = ChatAttachmentMeta {
+        id: id.clone(),
+        name: name.clone(),
+        mime: chat_file_mime(&name),
+        size: source_meta.len(),
+    };
+    let directory = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| format!("无法获取缓存目录: {error}"))?
+        .join("chat-attachments");
+    std::fs::create_dir_all(&directory).map_err(|error| format!("创建附件缓存失败: {error}"))?;
+    let extension = source
+        .extension()
+        .and_then(|value| value.to_str())
+        .filter(|value| value.len() <= 16)
+        .unwrap_or("bin");
+    let cached = directory.join(format!("{id}.{extension}"));
+    std::fs::copy(&source, &cached).map_err(|error| format!("缓存聊天附件失败: {error}"))?;
+    let chat_service = { state.core.lock().await.get_chat_service() };
+    chat_service
+        .lock()
+        .await
+        .register_attachment(meta.clone(), cached, recipient_id)?;
+    Ok(Some(meta))
+}
+
+async fn ensure_chat_attachment_cached(
+    owner_player_id: &str,
+    meta: &ChatAttachmentMeta,
+    app: &tauri::AppHandle,
+    state: &AppState,
+) -> Result<std::path::PathBuf, String> {
+    if !valid_attachment_meta(meta) {
+        return Err("文件附件元数据无效".to_string());
+    }
+    let chat_service = { state.core.lock().await.get_chat_service() };
+    let chat = chat_service.lock().await;
+    let local = chat.get_local_identity().ok_or("聊天会话尚未初始化")?;
+    if local.player_id == owner_player_id {
+        return chat
+            .local_attachment_path(meta)
+            .ok_or_else(|| "本地附件已失效".to_string());
+    }
+    let peer = chat
+        .peer_by_player_id(owner_player_id)
+        .ok_or("附件发送者已离开大厅")?;
+    let token = chat.get_chat_token().ok_or("聊天令牌尚未就绪")?;
+    drop(chat);
+    let directory = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| format!("无法获取缓存目录: {error}"))?
+        .join("chat-attachments");
+    let extension = std::path::Path::new(&meta.name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .filter(|value| value.len() <= 16)
+        .unwrap_or("bin");
+    let cached = directory.join(format!(
+        "{}-{}.{}",
+        owner_player_id.replace(|ch: char| !ch.is_ascii_alphanumeric(), "_"),
+        meta.id,
+        extension
+    ));
+    if std::fs::metadata(&cached)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.len() == meta.size)
+    {
+        return Ok(cached);
+    }
+    let path = format!("/api/chat/attachment/{}", meta.id);
+    let signed = chat_service
+        .lock()
+        .await
+        .sign_request("GET", &path, &peer.virtual_ip, &[])
+        .ok_or("聊天签名不可用")?;
+    let host = chat_http_host(&peer.virtual_ip)?;
+    let response = with_chat_signature(
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .connect_timeout(std::time::Duration::from_secs(4))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|error| format!("创建附件客户端失败: {error}"))?
+            .get(format!("http://{host}:14540{path}"))
+            .header(CHAT_TOKEN_HEADER, token),
+        &signed,
+    )
+    .send()
+    .await
+    .map_err(|error| format!("获取聊天附件失败: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!("获取聊天附件失败: HTTP {}", response.status()));
+    }
+    let encrypted = read_remote_body_limited(response, MAX_CHAT_ATTACHMENT_RESPONSE_BYTES).await?;
+    let plain = chat_service
+        .lock()
+        .await
+        .decrypt_from_peer(&peer, &path, &encrypted)?;
+    if plain.len() as u64 != meta.size || plain.len() as u64 > MAX_CHAT_ATTACHMENT_BYTES {
+        return Err("附件实际大小与消息元数据不一致".to_string());
+    }
+    tokio::fs::create_dir_all(&directory)
+        .await
+        .map_err(|error| format!("创建附件缓存失败: {error}"))?;
+    tokio::fs::write(&cached, plain)
+        .await
+        .map_err(|error| format!("写入附件缓存失败: {error}"))?;
+    Ok(cached)
+}
+
+#[tauri::command]
+pub async fn fetch_chat_attachment(
+    owner_player_id: String,
+    attachment: ChatAttachmentMeta,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let path = ensure_chat_attachment_cached(&owner_player_id, &attachment, &app, &state).await?;
+    path.to_str()
+        .map(str::to_string)
+        .ok_or_else(|| "附件缓存路径无效".to_string())
+}
+
+#[tauri::command]
+pub async fn save_chat_attachment(
+    owner_player_id: String,
+    attachment: ChatAttachmentMeta,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Option<String>, String> {
+    let cached = ensure_chat_attachment_cached(&owner_player_id, &attachment, &app, &state).await?;
+    let Some(destination) = rfd::FileDialog::new()
+        .set_title("下载文件")
+        .set_file_name(&attachment.name)
+        .save_file()
+    else {
+        return Ok(None);
+    };
+    std::fs::copy(&cached, &destination).map_err(|error| format!("保存文件失败: {error}"))?;
+    Ok(destination.to_str().map(str::to_string))
+}
+
+#[tauri::command]
+pub async fn preview_spreadsheet_attachment(
+    owner_player_id: String,
+    attachment: ChatAttachmentMeta,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Vec<String>, String> {
+    use calamine::Reader;
+
+    let extension = std::path::Path::new(&attachment.name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !matches!(extension.as_str(), "xls" | "xlsx" | "xlsb" | "ods") {
+        return Err("不支持的电子表格格式".into());
+    }
+    let cached = ensure_chat_attachment_cached(&owner_player_id, &attachment, &app, &state).await?;
+    tokio::task::spawn_blocking(move || {
+        let mut workbook = calamine::open_workbook_auto(&cached)
+            .map_err(|error| format!("无法解析电子表格: {error}"))?;
+        let sheet_names = workbook.sheet_names().to_vec();
+        let mut sections = Vec::new();
+        for (sheet_index, sheet_name) in sheet_names.into_iter().take(50).enumerate() {
+            let range = workbook
+                .worksheet_range(&sheet_name)
+                .map_err(|error| format!("无法读取工作表: {error}"))?;
+            let rows = range.rows().take(500).map(|row| {
+                row.iter().take(50).map(ToString::to_string).collect::<Vec<_>>().join("\t")
+            }).collect::<Vec<_>>();
+            sections.push(format!("--- {} ---\n{}", sheet_index + 1, rows.join("\n")));
+        }
+        if sections.is_empty() {
+            return Err("电子表格中没有可预览的工作表".into());
+        }
+        Ok(sections)
+    })
+    .await
+    .map_err(|error| format!("电子表格预览任务失败: {error}"))?
+}
+
+#[tauri::command]
+pub async fn preview_office_attachment(
+    owner_player_id: String,
+    attachment: ChatAttachmentMeta,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let extension = std::path::Path::new(&attachment.name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let kind = match extension.as_str() {
+        "doc" | "docx" | "odt" | "rtf" => "word",
+        "ppt" | "pptx" | "odp" => "powerpoint",
+        _ => return Err("该格式不需要系统 Office 转换".into()),
+    };
+    let cached = ensure_chat_attachment_cached(&owner_player_id, &attachment, &app, &state).await?;
+    let directory = app.path().app_cache_dir()
+        .map_err(|error| format!("无法获取缓存目录: {error}"))?
+        .join("office-previews");
+    tokio::fs::create_dir_all(&directory).await
+        .map_err(|error| format!("无法创建文档预览缓存: {error}"))?;
+    let output_path = directory.join(format!("{}.pdf", attachment.id));
+
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        let script = r#"param([string]$source,[string]$destination,[string]$kind)
+$ErrorActionPreference='Stop'
+$application=$null
+$document=$null
+try {
+  if ($kind -eq 'word') {
+    $application=New-Object -ComObject Word.Application
+    $application.Visible=$false
+    $document=$application.Documents.Open($source,$false,$true)
+    $document.ExportAsFixedFormat($destination,17)
+  } elseif ($kind -eq 'powerpoint') {
+    $application=New-Object -ComObject PowerPoint.Application
+    $document=$application.Presentations.Open($source,$true,$false,$false)
+    $document.SaveAs($destination,32)
+  } else { throw 'Unsupported Office kind' }
+} finally {
+  if ($null -ne $document) { $document.Close() }
+  if ($null -ne $application) { $application.Quit() }
+}"#;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(35),
+            tokio::process::Command::new(windows_system_command("WindowsPowerShell\\v1.0\\powershell.exe"))
+                .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script])
+                .arg(&cached)
+                .arg(&output_path)
+                .arg(kind)
+                .creation_flags(CREATE_NO_WINDOW)
+                .output(),
+        ).await.map_err(|_| "Office 文档转换超时".to_string())?
+            .map_err(|error| format!("无法启动系统 Office 预览转换: {error}"))?;
+        if !result.status.success() || !output_path.is_file() {
+            return Err("无法生成文档预览，请确认已安装 Microsoft Office".into());
+        }
+        return output_path.to_str().map(str::to_string).ok_or_else(|| "预览路径无效".into());
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = (cached, output_path, kind);
+        Err("当前系统没有可用的旧版 Office 文档转换器".into())
+    }
+}
+
+#[tauri::command]
+pub async fn transcribe_voice_message(
+    wav_data: Vec<u8>,
+    language: String,
+    app: tauri::AppHandle,
+) -> Result<String, String> {
+    if wav_data.len() < 44 || wav_data.len() > 4 * 1024 * 1024 || &wav_data[..4] != b"RIFF" || &wav_data[8..12] != b"WAVE" {
+        return Err("语音数据格式无效".into());
+    }
+    if !matches!(language.as_str(), "zh-CN" | "en-US") {
+        return Err("不支持的识别语言".into());
+    }
+    let directory = app.path().app_cache_dir()
+        .map_err(|error| format!("无法获取缓存目录: {error}"))?
+        .join("voice-transcription");
+    tokio::fs::create_dir_all(&directory).await
+        .map_err(|error| format!("无法创建语音识别缓存: {error}"))?;
+    let wav_path = directory.join(format!("{}.wav", uuid::Uuid::new_v4()));
+    tokio::fs::write(&wav_path, wav_data).await
+        .map_err(|error| format!("无法准备语音识别数据: {error}"))?;
+
+    #[cfg(windows)]
+    let recognition = {
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        let script = r#"param([string]$cultureName,[string]$wavPath)
+$ErrorActionPreference='Stop'
+[Console]::OutputEncoding=New-Object System.Text.UTF8Encoding($false)
+Add-Type -AssemblyName System.Speech
+$culture=[System.Globalization.CultureInfo]::GetCultureInfo($cultureName)
+$installed=[System.Speech.Recognition.SpeechRecognitionEngine]::InstalledRecognizers()
+$selected=$installed | Where-Object { $_.Culture.Name -eq $culture.Name } | Select-Object -First 1
+if ($null -eq $selected) {
+  $selected=$installed | Where-Object { $_.Culture.TwoLetterISOLanguageName -eq $culture.TwoLetterISOLanguageName } | Select-Object -First 1
+}
+if ($null -eq $selected) { $selected=$installed | Select-Object -First 1 }
+if ($null -eq $selected) { throw 'No Windows speech recognizer is installed' }
+$engine=[System.Speech.Recognition.SpeechRecognitionEngine]::new($selected)
+$grammar=New-Object System.Speech.Recognition.DictationGrammar
+$engine.LoadGrammar($grammar)
+$engine.SetInputToWaveFile($wavPath)
+$parts=New-Object System.Collections.Generic.List[string]
+while ($true) {
+  $result=$engine.Recognize([TimeSpan]::FromSeconds(8))
+  if ($null -eq $result) { break }
+  if ($result.Confidence -ge 0.15 -and -not [string]::IsNullOrWhiteSpace($result.Text)) { $parts.Add($result.Text) }
+}
+$engine.Dispose()
+[Console]::Write(($parts -join ' '))"#;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(45),
+            tokio::process::Command::new(windows_system_command("WindowsPowerShell\\v1.0\\powershell.exe"))
+                .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script])
+                .arg(&language)
+                .arg(&wav_path)
+                .creation_flags(CREATE_NO_WINDOW)
+                .output(),
+        ).await.map_err(|_| "语音识别超时".to_string())?
+            .map_err(|error| format!("无法启动系统语音识别: {error}"))
+    };
+    #[cfg(not(windows))]
+    let recognition: Result<std::process::Output, String> = Err("当前系统暂不支持本地语音转文字".into());
+
+    let _ = tokio::fs::remove_file(&wav_path).await;
+    let output = recognition?;
+    if !output.status.success() {
+        return Err("系统语音识别不可用，请安装对应的语音识别语言".into());
+    }
+    String::from_utf8(output.stdout)
+        .map(|value| value.trim().to_string())
+        .map_err(|_| "系统语音识别返回了无效文本".into())
+}
+
 /// 发送P2P聊天消息
 ///
 /// # 参数
@@ -5342,6 +5919,8 @@ pub async fn send_p2p_chat_message(
     let msg_type = match message_type.as_str() {
         "text" => MessageType::Text,
         "image" => MessageType::Image,
+        "voice" => MessageType::Voice,
+        "file" => MessageType::File,
         "announce" => MessageType::Announce,
         "voicegroup" => MessageType::VoiceGroup,
         "clipboard" => MessageType::Clipboard,
@@ -5361,6 +5940,13 @@ pub async fn send_p2p_chat_message(
         local_is_host,
         &local_messages,
     )?;
+    if matches!(msg_type, MessageType::File) {
+        let meta: ChatAttachmentMeta =
+            serde_json::from_str(&content).map_err(|_| "文件消息元数据无法解析".to_string())?;
+        if !chat_svc.has_attachment(&meta.id, recipient_id.as_deref()) {
+            return Err("文件附件未注册或收件人不匹配".to_string());
+        }
+    }
 
     let message_id = message_id
         .filter(|id| !id.is_empty())
@@ -5373,7 +5959,14 @@ pub async fn send_p2p_chat_message(
     // network destinations. Broadcast to the authoritative signaling roster.
     let mut authoritative_peers = chat_svc.authoritative_peers();
     if let Some(target) = recipient_id.as_ref() {
-        if !matches!(msg_type, MessageType::Text | MessageType::Image | MessageType::Recall) {
+        if !matches!(
+            msg_type,
+            MessageType::Text
+                | MessageType::Image
+                | MessageType::Voice
+                | MessageType::File
+                | MessageType::Recall
+        ) {
             return Err("此消息类型不支持私聊".to_string());
         }
         authoritative_peers.retain(|peer| &peer.player_id == target);
@@ -5422,7 +6015,7 @@ pub async fn send_p2p_chat_message(
     let mut tasks = Vec::new();
 
     for peer in authoritative_peers {
-        let peer_ip = peer.virtual_ip;
+        let peer_ip = peer.virtual_ip.clone();
         let host = chat_http_host(&peer_ip)?;
         let url = format!("http://{}:14540/api/chat/send", host);
         let request = SendMessageRequest {
@@ -5439,6 +6032,10 @@ pub async fn send_p2p_chat_message(
         // principle emit different bytes and break verification.
         let body = serde_json::to_vec(&request)
             .map_err(|error| format!("序列化聊天消息失败: {}", error))?;
+        let body = chat_service
+            .lock()
+            .await
+            .encrypt_for_peer(&peer, "/api/chat/send", &body)?;
 
         let client_clone = client.clone();
         let url_clone = url.clone();
@@ -5545,6 +6142,17 @@ fn is_safe_remote_chat_message(
     }
     let content_bytes = message.content.as_bytes().len();
     let shape_is_valid = match message.message_type {
+        MessageType::Voice => super::chat_service::valid_voice_payload(
+            &message.content,
+            message.image_data.as_deref(),
+        ),
+        MessageType::File => {
+            content_bytes > 0
+                && content_bytes <= MAX_FILE_CONTENT_BYTES
+                && message.image_data.is_none()
+                && serde_json::from_str::<ChatAttachmentMeta>(&message.content)
+                    .is_ok_and(|meta| valid_attachment_meta(&meta))
+        }
         MessageType::Text => {
             content_bytes > 0 && content_bytes <= MAX_TEXT_BYTES && message.image_data.is_none()
         }
@@ -5676,6 +6284,13 @@ pub async fn get_p2p_chat_messages(
                                 log::warn!("⚠️ 聊天历史响应超限 ({}): {}", expected_ip, error);
                                 return Vec::new();
                             }
+                        };
+                        let Ok(body) = chat_service_clone.lock().await.decrypt_from_peer(
+                            &expected,
+                            "/api/chat/messages",
+                            &body,
+                        ) else {
+                            return Vec::new();
                         };
                         let Ok(mut messages) =
                             serde_json::from_slice::<Vec<ChatServiceMessage>>(&body)
@@ -6207,7 +6822,7 @@ pub async fn read_log_file() -> Result<String, String> {
 pub async fn save_settings(
     language: Option<String>,
     auto_startup: bool,
-    auto_lobby_enabled: bool,
+    auto_lobby_enabled: Option<bool>,
     lobby_name: Option<String>,
     lobby_password: Option<String>,
     player_name: Option<String>,
@@ -6236,7 +6851,7 @@ pub async fn save_settings(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     use crate::modules::config_manager::{AutoLobbyConfig, EasyTierNode};
-    log::info!("保存设置: auto_startup={}, auto_lobby_enabled={}, use_private_server={}, always_on_top={:?}, remember_window_position={:?}, voice_volume={:?}, enable_gpu_rendering={:?}, mic_hotkey={:?}, global_mute_hotkey={:?}, push_to_talk_hotkey={:?}, enable_exit_node={:?}, subnet_proxy_cidrs={:?}, virtual_domain={:?}", 
+    log::info!("保存设置: auto_startup={}, auto_lobby_enabled={:?}, use_private_server={}, always_on_top={:?}, remember_window_position={:?}, voice_volume={:?}, enable_gpu_rendering={:?}, mic_hotkey={:?}, global_mute_hotkey={:?}, push_to_talk_hotkey={:?}, enable_exit_node={:?}, subnet_proxy_cidrs={:?}, virtual_domain={:?}",
         auto_startup, auto_lobby_enabled, use_private_server, always_on_top, remember_window_position, voice_volume, enable_gpu_rendering, mic_hotkey, global_mute_hotkey, push_to_talk_hotkey, enable_exit_node, subnet_proxy_cidrs, virtual_domain);
 
     let legacy_config_password = {
@@ -6250,6 +6865,7 @@ pub async fn save_settings(
             .and_then(|auto_lobby| auto_lobby.lobby_password.clone())
     };
     if let Some(password) = lobby_password.clone().or(legacy_config_password) {
+        let password = super::secret_store::resolve(&password)?;
         tokio::task::spawn_blocking(move || write_auto_lobby_secret(&password))
             .await
             .map_err(|error| format!("保存系统凭据任务失败: {}", error))??;
@@ -6296,7 +6912,7 @@ pub async fn save_settings(
                 );
 
                 config.auto_lobby = Some(AutoLobbyConfig {
-                    enabled: auto_lobby_enabled,
+                    enabled: auto_lobby_enabled.unwrap_or(existing.enabled),
                     lobby_name: lobby_name.clone().or(existing.lobby_name),
                     lobby_password: None,
                     player_name: player_name.clone().or(existing.player_name),
@@ -6477,15 +7093,14 @@ pub async fn get_settings(state: State<'_, AppState>) -> Result<serde_json::Valu
     let auto_lobby = config.auto_lobby.clone().unwrap_or_default();
     let mut lobby_password = tokio::task::spawn_blocking(read_auto_lobby_secret)
         .await
-        .map_err(|error| format!("读取系统凭据任务失败: {}", error))?;
+        .map_err(|error| format!("读取系统凭据任务失败: {}", error))??;
     if let Some(legacy_password) = auto_lobby.lobby_password.clone() {
         if lobby_password.is_none() {
-            let password = legacy_password.clone();
-            match tokio::task::spawn_blocking(move || write_auto_lobby_secret(&password)).await {
-                Ok(Ok(())) => lobby_password = Some(legacy_password),
-                Ok(Err(error)) => log::warn!("迁移自动大厅密码失败: {}", error),
-                Err(error) => log::warn!("迁移系统凭据任务失败: {}", error),
-            }
+            let password = super::secret_store::resolve(&legacy_password)?;
+            tokio::task::spawn_blocking(move || write_auto_lobby_secret(&password))
+                .await
+                .map_err(|_| "Cannot migrate lobby password")??;
+            lobby_password = Some(legacy_password);
         }
 
         let core = state.core.lock().await;
@@ -6567,7 +7182,7 @@ pub async fn get_settings(state: State<'_, AppState>) -> Result<serde_json::Valu
         "autoStartup": actual_auto_start,
         "autoLobbyEnabled": auto_lobby.enabled,
         "lobbyName": auto_lobby.lobby_name,
-        "lobbyPassword": lobby_password,
+        "lobbyPassword": lobby_password.map(super::secret_store::protect_lobby_password).transpose()?,
         "playerName": auto_lobby.player_name,
         "avatarData": config.avatar_data.clone(),
         "useDomain": auto_lobby.use_domain,

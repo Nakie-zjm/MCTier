@@ -10,6 +10,7 @@
 //    发送套接字绑定 127.0.0.1，使本机 Minecraft 读取到的服务器地址为 127.0.0.1:代理端口。
 // 3. 本机 Minecraft 在「局域网」列表看到该世界，点击即连到 127.0.0.1:代理端口 → 代理转发到房主。
 
+use super::virtual_network::virtual_host;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
@@ -17,7 +18,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
-use super::virtual_network::virtual_host;
 
 /// 前端传入的待广播服务器
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -89,7 +89,9 @@ fn pipe(mut a: TcpStream, mut b: TcpStream) {
 /// 启动一个本地代理监听，转发到 远端 ip:port，返回分配到的本地端口
 fn start_proxy(target_ip: String, target_port: u16, alive: Arc<AtomicBool>) -> Option<u16> {
     let target_ip = virtual_host(&target_ip)?;
-    if target_port == 0 { return None; }
+    if target_port == 0 {
+        return None;
+    }
     // 仅监听 127.0.0.1：组播公告的源地址即 127.0.0.1，本机 Minecraft 会回连到 127.0.0.1:端口；
     // 不暴露到其它网卡，避免物理局域网的人通过本代理连到房主游戏。
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).ok()?;
@@ -105,7 +107,10 @@ fn start_proxy(target_ip: String, target_port: u16, alive: Arc<AtomicBool>) -> O
                     let ip = target_ip.clone();
                     thread::spawn(move || {
                         let _ = client.set_nodelay(true);
-                        match TcpStream::connect_timeout(&std::net::SocketAddr::from((ip, target_port)), Duration::from_secs(3)) {
+                        match TcpStream::connect_timeout(
+                            &std::net::SocketAddr::from((ip, target_port)),
+                            Duration::from_secs(3),
+                        ) {
                             Ok(server) => {
                                 let _ = server.set_nodelay(true);
                                 pipe(client, server);
@@ -184,7 +189,11 @@ fn ensure_emit_thread() {
 /// 设置/更新要在本机 Minecraft 局域网列表中显示的服务器集合
 #[tauri::command]
 pub fn start_mc_lan_broadcast(servers: Vec<McServer>) -> Result<(), String> {
-    if servers.len() > 254 || servers.iter().any(|s| virtual_host(&s.ip).is_none() || s.port == 0 || s.motd.len() > 1024) {
+    if servers.len() > 254
+        || servers
+            .iter()
+            .any(|s| virtual_host(&s.ip).is_none() || s.port == 0 || s.motd.len() > 1024)
+    {
         return Err("仅允许最多 254 个虚拟网段内的 Minecraft 服务器，端口必须非零".into());
     }
     let mut b = bridge().lock().map_err(|_| "锁失败".to_string())?;

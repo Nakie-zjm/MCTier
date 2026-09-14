@@ -200,6 +200,91 @@ pub struct ChatSigner {
 }
 
 impl ChatSigner {
+    fn encryption_key(&self, peer: &str, token: &str) -> Result<[u8; 32], String> {
+        use p256::pkcs8::DecodePublicKey;
+        let der = parse_public_key_b64(peer).ok_or("Invalid encryption peer")?;
+        let public = p256::PublicKey::from_public_key_der(&der)
+            .map_err(|_| "Invalid encryption public key")?;
+        let secret = p256::SecretKey::from_slice(&self.signing_key.to_bytes())
+            .map_err(|_| "Invalid encryption identity")?;
+        let shared = p256::ecdh::diffie_hellman(secret.to_nonzero_scalar(), public.as_affine());
+        let mut key = [0u8; 32];
+        hkdf::Hkdf::<sha2::Sha256>::new(Some(token.as_bytes()), shared.raw_secret_bytes())
+            .expand(b"MCTier/chat-aead/v1", &mut key)
+            .map_err(|_| "Key derivation failed")?;
+        Ok(key)
+    }
+
+    pub fn encrypt(
+        &self,
+        peer: &str,
+        token: &str,
+        path: &str,
+        body: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        use aes_gcm::{
+            aead::{Aead, KeyInit, Payload},
+            Aes256Gcm, Nonce,
+        };
+        use rand::RngCore;
+        let mut nonce = [0u8; 12];
+        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        let peer_id = key_id_for_public_key(&parse_public_key_b64(peer).ok_or("Invalid peer")?);
+        let aad = format!("MCTier/chat/v1\n{path}\n{}\n{peer_id}", self.key_id);
+        let cipher = Aes256Gcm::new_from_slice(&self.encryption_key(peer, token)?)
+            .map_err(|_| "Invalid key")?;
+        let encrypted = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: body,
+                    aad: aad.as_bytes(),
+                },
+            )
+            .map_err(|_| "Chat encryption failed")?;
+        serde_json::to_vec(&serde_json::json!({"v": 1, "data": base64_encode(&[nonce.to_vec(), encrypted].concat())})).map_err(|_| "Invalid envelope".into())
+    }
+
+    pub fn decrypt(
+        &self,
+        peer: &str,
+        token: &str,
+        path: &str,
+        body: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        use aes_gcm::{
+            aead::{Aead, KeyInit, Payload},
+            Aes256Gcm, Nonce,
+        };
+        let envelope: serde_json::Value =
+            serde_json::from_slice(body).map_err(|_| "Invalid encrypted envelope")?;
+        if envelope["v"].as_u64() != Some(1) {
+            return Err("Encrypted chat required".into());
+        }
+        let bytes = base64_decode(
+            envelope["data"]
+                .as_str()
+                .ok_or("Invalid encrypted payload")?,
+        )
+        .ok_or("Invalid base64")?;
+        if bytes.len() < 28 || bytes.len() > 64 * 1024 * 1024 + 28 {
+            return Err("Invalid encrypted size".into());
+        }
+        let peer_id = key_id_for_public_key(&parse_public_key_b64(peer).ok_or("Invalid peer")?);
+        let aad = format!("MCTier/chat/v1\n{path}\n{peer_id}\n{}", self.key_id);
+        let cipher = Aes256Gcm::new_from_slice(&self.encryption_key(peer, token)?)
+            .map_err(|_| "Invalid key")?;
+        cipher
+            .decrypt(
+                Nonce::from_slice(&bytes[..12]),
+                Payload {
+                    msg: &bytes[12..],
+                    aad: aad.as_bytes(),
+                },
+            )
+            .map_err(|_| "Chat authentication failed".into())
+    }
+
     /// Generate a fresh key pair. One is created per lobby session, so leaving
     /// a lobby permanently retires the credential.
     pub fn generate() -> Result<Self, String> {
@@ -377,6 +462,79 @@ impl ReplayGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encrypted_messages_are_pairwise_and_context_bound() {
+        let alice = ChatSigner::generate().unwrap();
+        let bob = ChatSigner::generate().unwrap();
+        let outsider = ChatSigner::generate().unwrap();
+        let token = "a".repeat(64);
+        let body = alice
+            .encrypt(
+                &bob.public_key_b64(),
+                &token,
+                "/api/chat/send",
+                b"private hello",
+            )
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&body).contains("private hello"));
+        assert_eq!(
+            bob.decrypt(&alice.public_key_b64(), &token, "/api/chat/send", &body)
+                .unwrap(),
+            b"private hello"
+        );
+        assert!(outsider
+            .decrypt(&alice.public_key_b64(), &token, "/api/chat/send", &body)
+            .is_err());
+        assert!(bob
+            .decrypt(
+                &alice.public_key_b64(),
+                &"b".repeat(64),
+                "/api/chat/send",
+                &body
+            )
+            .is_err());
+        assert!(bob
+            .decrypt(&alice.public_key_b64(), &token, "/api/chat/messages", &body)
+            .is_err());
+        let mut envelope: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let mut ciphertext = base64_decode(envelope["data"].as_str().unwrap()).unwrap();
+        ciphertext[15] ^= 1;
+        envelope["data"] = base64_encode(&ciphertext).into();
+        assert!(bob
+            .decrypt(
+                &alice.public_key_b64(),
+                &token,
+                "/api/chat/send",
+                &serde_json::to_vec(&envelope).unwrap()
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn decrypts_independent_node_crypto_interop_vector() {
+        let mut scalar = [0u8; 32];
+        scalar[31] = 2;
+        let signing_key = SigningKey::from_slice(&scalar).unwrap();
+        let der = signing_key
+            .verifying_key()
+            .to_public_key_der()
+            .unwrap()
+            .as_bytes()
+            .to_vec();
+        let bob = ChatSigner {
+            key_id: key_id_for_public_key(&der),
+            signing_key,
+            public_key_der: der,
+        };
+        let alice = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEaxfR8uEsQkf4vOblY6RA8ncDfYEt6zOg9KE5RdiYwpZP40Li/hp/m47n60p8D54WK84zV2sxXs7LtkBoN79R9Q==";
+        let body = br#"{"v":1,"data":"BwcHBwcHBwcHBwcHDk2BAaPbB4PVW1taZHelGpAC6wy583tf6FTKhtA="}"#;
+        assert_eq!(
+            bob.decrypt(alice, &"a".repeat(64), "/api/chat/send", body)
+                .unwrap(),
+            b"private hello"
+        );
+    }
 
     fn signer() -> ChatSigner {
         ChatSigner::generate().expect("generate signer")

@@ -17,13 +17,13 @@ pub mod network_service;
 pub mod lobby_manager;
 
 // Hosts文件管理模块（Magic DNS）
+pub mod firewall_policy;
+pub mod helper_handshake;
 pub mod hosts_manager;
 pub mod hosts_security;
-pub mod helper_handshake;
-pub mod firewall_policy;
-pub mod virtual_network;
 #[cfg(unix)]
 pub mod unix_hosts_helper;
+pub mod virtual_network;
 
 // 语音服务模块
 #[cfg(windows)]
@@ -60,7 +60,9 @@ pub mod file_transfer;
 pub mod chat_service;
 
 // 聊天鉴权：每成员密钥对 + 请求签名（消除虚拟IP伪造空间）
+pub mod builtin_emoji;
 pub mod chat_auth;
+pub mod secret_store;
 
 // Minecraft 局域网世界自动发现模块
 pub mod minecraft_discovery;

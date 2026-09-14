@@ -4,6 +4,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { useTranslation } from 'react-i18next';
 import { tl } from '../../i18n';
 import './GlobalAdvancedConfigPanel.css';
+import { NvidiaNoiseSetting } from '../VoiceSettings/NvidiaNoiseSetting';
 
 const { Panel } = Collapse;
 
@@ -53,6 +54,7 @@ export const GlobalAdvancedConfigPanel: React.FC = () => {
 
   return (
     <div className="global-advanced-config-panel">
+      <NvidiaNoiseSetting />
       <div className="global-advanced-config-header">
         <h3>{tl('全局 EasyTier 高级配置', 'Global EasyTier Advanced Config')}</h3>
       </div>
@@ -282,11 +284,8 @@ export const GlobalAdvancedConfigPanel: React.FC = () => {
 
           {/* 加密和安全 */}
           <Panel header={tl('加密和安全', 'Encryption & Security')} key="security">
-            <Form.Item name="disable_encryption" label={tl('禁用加密', 'Disable Encryption')} valuePropName="checked" tooltip={tl('警告：禁用加密会降低安全性', 'Warning: disabling encryption reduces security')}>
-              <Switch />
-            </Form.Item>
-            <Form.Item name="encryption_algorithm" label={tl('加密算法', 'Encryption Algorithm')} tooltip={tl('支持：aes-gcm, aes-256-gcm, xor, chacha20', 'Supported: aes-gcm, aes-256-gcm, xor, chacha20')}>
-              <Input placeholder="aes-gcm" />
+            <Form.Item label={tl('加密算法', 'Encryption Algorithm')}>
+              <Input value="AES-256-GCM" readOnly />
             </Form.Item>
           </Panel>
 
