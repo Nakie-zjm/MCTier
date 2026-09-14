@@ -3,11 +3,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { readTauriCommandSources } from './helpers/tauriCommandsSource.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const read = (relativePath) => fs.readFileSync(path.join(root, relativePath), 'utf8');
 
-const commands = read('src-tauri/src/modules/tauri_commands.rs');
+const commands = readTauriCommandSources();
 const configManager = read('src-tauri/src/modules/config_manager.rs');
 const cargoManifest = read('src-tauri/Cargo.toml');
 const capability = JSON.parse(read('src-tauri/capabilities/default.json'));
