@@ -1,4 +1,4 @@
-use futures_util::{stream, StreamExt, TryStreamExt};
+use futures_util::{stream, StreamExt};
 use serde::Serialize;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -17,7 +17,7 @@ const MAX_PAGE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_GIF_BYTES: usize = 4 * 1024 * 1024;
 const MAX_EMOJI_COUNT: usize = 2_000;
 const MIN_EMOJI_COUNT: usize = 100;
-const DOWNLOAD_CONCURRENCY: usize = 8;
+const DOWNLOAD_CONCURRENCY: usize = 10;
 static SYNC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[derive(Clone, Serialize)]
@@ -110,10 +110,11 @@ async fn valid_cached_gif(path: &Path) -> bool {
     file.read_exact(&mut header).await.is_ok() && (&header == b"GIF87a" || &header == b"GIF89a")
 }
 
-async fn completed_cache(cache_dir: &Path) -> Option<Vec<BuiltinEmojiAsset>> {
-    let index = tokio::fs::read_to_string(cache_dir.join("complete-v1.txt"))
-        .await
-        .ok()?;
+async fn cached_index(path: &Path) -> Option<Vec<String>> {
+    if tokio::fs::metadata(path).await.ok()?.len() > 128 * 1024 {
+        return None;
+    }
+    let index = tokio::fs::read_to_string(path).await.ok()?;
     let ids = index
         .lines()
         .filter(|line| !line.is_empty())
@@ -131,12 +132,30 @@ async fn completed_cache(cache_dir: &Path) -> Option<Vec<BuiltinEmojiAsset>> {
         {
             return None;
         }
+    }
+    Some(ids)
+}
+
+async fn completed_cache(cache_dir: &Path) -> Option<Vec<BuiltinEmojiAsset>> {
+    let ids = cached_index(&cache_dir.join("complete-v1.txt")).await?;
+    for id in &ids {
         let path = cache_dir.join(format!("{id}.gif"));
         if !valid_cached_gif(&path).await {
             return None;
         }
     }
     Some(assets(cache_dir, &ids))
+}
+
+async fn complete_download_batch<F: std::future::Future<Output = Result<(), String>>>(
+    tasks: impl IntoIterator<Item = F>,
+) -> Result<(), String> {
+    let results = stream::iter(tasks)
+        .buffer_unordered(DOWNLOAD_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+    // A failed resource must not cancel the other downloads or discard their cache.
+    results.into_iter().collect()
 }
 
 async fn download_one(
@@ -197,22 +216,36 @@ pub async fn sync_builtin_emoji(app: tauri::AppHandle) -> Result<Vec<BuiltinEmoj
         .user_agent("MCTier/3.4 emoji-cache")
         .build()
         .map_err(|error| format!("无法创建表情下载客户端: {error}"))?;
-    let response = client
-        .get(SOURCE_PAGE)
-        .send()
-        .await
-        .map_err(|error| format!("获取表情页面失败: {error}"))?;
-    if !response.status().is_success() {
-        return Err(format!("获取表情页面失败: HTTP {}", response.status()));
-    }
-    let html = String::from_utf8(read_limited(response, MAX_PAGE_BYTES).await?)
-        .map_err(|_| "表情页面编码无效".to_string())?;
-    let ids = parse_ids(&html)?;
+    let ids = if let Some(ids) = cached_index(&cache_dir.join("index-v1.txt")).await {
+        ids
+    } else {
+        let response = client
+            .get(SOURCE_PAGE)
+            .send()
+            .await
+            .map_err(|error| format!("获取表情页面失败: {error}"))?;
+        if !response.status().is_success() {
+            return Err(format!("获取表情页面失败: HTTP {}", response.status()));
+        }
+        let html = String::from_utf8(read_limited(response, MAX_PAGE_BYTES).await?)
+            .map_err(|_| "表情页面编码无效".to_string())?;
+        let ids = parse_ids(&html)?;
+        tokio::fs::write(cache_dir.join("index-v1.txt"), ids.join("\n"))
+            .await
+            .map_err(|error| format!("保存表情下载索引失败: {error}"))?;
+        ids
+    };
     let total = ids.len();
-    let completed = Arc::new(AtomicUsize::new(0));
-    emit_progress(&app, 0, total);
+    let mut pending = Vec::new();
+    for id in &ids {
+        if !valid_cached_gif(&cache_dir.join(format!("{id}.gif"))).await {
+            pending.push(id.clone());
+        }
+    }
+    let completed = Arc::new(AtomicUsize::new(total - pending.len()));
+    emit_progress(&app, completed.load(Ordering::Relaxed), total);
 
-    stream::iter(ids.iter().cloned().map(|id| {
+    complete_download_batch(pending.into_iter().map(|id| {
         let app = app.clone();
         let client = client.clone();
         let cache_dir = cache_dir.clone();
@@ -224,8 +257,6 @@ pub async fn sync_builtin_emoji(app: tauri::AppHandle) -> Result<Vec<BuiltinEmoj
             Ok::<(), String>(())
         }
     }))
-    .buffer_unordered(DOWNLOAD_CONCURRENCY)
-    .try_collect::<Vec<_>>()
     .await?;
     let marker = cache_dir.join("complete-v1.txt");
     let temporary_marker = cache_dir.join("complete-v1.tmp");
@@ -244,6 +275,32 @@ pub async fn sync_builtin_emoji(app: tauri::AppHandle) -> Result<Vec<BuiltinEmoj
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn ten_downloads_run_in_parallel_and_one_failure_does_not_cancel_the_batch() {
+        let active = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let finished = AtomicUsize::new(0);
+        let result = complete_download_batch((0..25).map(|index| {
+            let (active, peak, finished) = (&active, &peak, &finished);
+            async move {
+                let count = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(count, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                finished.fetch_add(1, Ordering::SeqCst);
+                if index == 0 {
+                    Err("temporary failure".into())
+                } else {
+                    Ok(())
+                }
+            }
+        }))
+        .await;
+        assert!(result.is_err());
+        assert_eq!(peak.load(Ordering::SeqCst), 10);
+        assert_eq!(finished.load(Ordering::SeqCst), 25);
+    }
 
     #[test]
     fn parser_extracts_safe_ids_and_deduplicates_them() {
@@ -282,6 +339,14 @@ mod tests {
         tokio::fs::write(cache_dir.join("complete-v1.txt"), ids.join("\n"))
             .await
             .unwrap();
+
+        tokio::fs::write(cache_dir.join("index-v1.txt"), ids.join("\n"))
+            .await
+            .unwrap();
+        assert_eq!(
+            cached_index(&cache_dir.join("index-v1.txt")).await.unwrap(),
+            ids
+        );
 
         assert_eq!(completed_cache(&cache_dir).await.unwrap().len(), ids.len());
         tokio::fs::write(cache_dir.join("0.gif"), b"<html>")

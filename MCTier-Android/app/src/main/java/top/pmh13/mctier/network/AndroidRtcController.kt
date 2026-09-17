@@ -17,6 +17,9 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import org.webrtc.AudioSource
 import org.webrtc.AudioTrack
+import org.webrtc.DataChannel
+import org.webrtc.RtpTransceiver
+import java.nio.ByteBuffer
 import org.webrtc.audio.JavaAudioDeviceModule
 import org.webrtc.IceCandidate
 import org.webrtc.MediaConstraints
@@ -56,6 +59,24 @@ class AndroidRtcController(private val context: Context) {
     )
     private val playerVolumes = linkedMapOf<String, Double>() // 0.0 ~ 1.0
     private var globalMuted = false
+    private val voiceRecordingLeases = mutableSetOf<Any>()
+    @Volatile private var voiceRecordingSuppressed = false
+
+    @Synchronized
+    fun suspendLobbyVoice(): () -> Unit {
+        val lease = Any()
+        voiceRecordingLeases.add(lease)
+        voiceRecordingSuppressed = true
+        localAudioTrack?.setEnabled(false)
+        return { releaseLobbyVoice(lease) }
+    }
+
+    @Synchronized
+    private fun releaseLobbyVoice(lease: Any) {
+        voiceRecordingLeases.remove(lease)
+        voiceRecordingSuppressed = voiceRecordingLeases.isNotEmpty()
+        localAudioTrack?.setEnabled(_micEnabled.value && !voiceRecordingSuppressed)
+    }
     // 通话中途连接抖动后的 ICE 自动重启任务（按 peer 防抖，避免重复重启）
     private val iceRestartJobs = ConcurrentHashMap<String, Job>()
 
@@ -63,7 +84,18 @@ class AndroidRtcController(private val context: Context) {
     val micEnabled: StateFlow<Boolean> = _micEnabled
 
     // 说话检测：根据各 peer 的音频电平判断谁在说话
-    private val rtcScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    // All peer state and native callbacks are serialized on Main; never block a native callback.
+    private val rtcScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private val knownPeers = mutableSetOf<String>()
+    private val peerTokens = mutableMapOf<String, Any>()
+    private val peerStartedAt = mutableMapOf<String, Long>()
+    private val health = mutableMapOf<String, VoiceHealth>()
+    private val healthChannels = mutableMapOf<String, DataChannel>()
+    private val remotePackets = mutableMapOf<String, Pair<Long, Long>>()
+    private val recoveryJobs = mutableMapOf<String, Job>()
+    private val recoveryAt = mutableMapOf<String, Long>()
+    private val lastHealthAt = mutableMapOf<String, Long>()
+    private val makingOffers = mutableSetOf<String>()
     private val audioLevels = ConcurrentHashMap<String, Double>()
     private val _speakingPlayers = MutableStateFlow<Set<String>>(emptySet())
     val speakingPlayers: StateFlow<Set<String>> = _speakingPlayers
@@ -86,17 +118,32 @@ class AndroidRtcController(private val context: Context) {
         statsJob = rtcScope.launch {
             while (isActive) {
                 delay(400)
+                val tick = android.os.SystemClock.elapsedRealtime()
+                knownPeers.toList().forEach { id ->
+                    val pc = peerConnections[id]
+                    val started = peerStartedAt.getOrPut(id) { tick }
+                    if (pc?.connectionState() == PeerConnection.PeerConnectionState.CONNECTED) {
+                        peerStartedAt[id] = tick
+                    } else if (tick - started >= 30_000L) {
+                        recoverPeer(id, "connection-timeout")
+                    }
+                }
                 val current = peerConnections.toMap()
                 current.forEach { (id, pc) ->
                     runCatching {
                         pc.getStats { report ->
+                          rtcScope.launch {
+                            if (peerConnections[id] !== pc) return@launch
+                            try {
                             var level = 0.0
                             var inboundBytes = 0L
                             var inboundPackets = 0L
                             var outboundBytes = 0L
                             var outboundPackets = 0L
                             var inboundLost = 0L
-                            report.statsMap.values.forEach { s ->
+                            var remoteSent: Long? = null
+                            report.statsMap.values.forEach stats@{ s ->
+                                if ((s.members["kind"] ?: s.members["mediaType"]) != "audio") return@stats
                                 if (s.type == "inbound-rtp") {
                                     (s.members["audioLevel"] as? Number)?.let { level = maxOf(level, it.toDouble()) }
                                     (s.members["bytesReceived"] as? Number)?.let { inboundBytes = maxOf(inboundBytes, it.toLong()) }
@@ -105,15 +152,40 @@ class AndroidRtcController(private val context: Context) {
                                 } else if (s.type == "outbound-rtp") {
                                     (s.members["bytesSent"] as? Number)?.let { outboundBytes = maxOf(outboundBytes, it.toLong()) }
                                     (s.members["packetsSent"] as? Number)?.let { outboundPackets = maxOf(outboundPackets, it.toLong()) }
+                                } else if (s.type == "remote-outbound-rtp") {
+                                    (s.members["packetsSent"] as? Number)?.let { remoteSent = (remoteSent ?: 0L) + it.toLong() }
                                 }
                             }
                             audioLevels[id] = level
                             val now = android.os.SystemClock.elapsedRealtime()
+                            if (now - (lastHealthAt[id] ?: 0L) >= 2000L && pc.connectionState() == PeerConnection.PeerConnectionState.CONNECTED) {
+                                lastHealthAt[id] = now
+                                healthChannels[id]?.let { channel ->
+                                    if (channel.state() == DataChannel.State.OPEN && channel.bufferedAmount() < 1024) {
+                                        val data = "{\"v\":1,\"packets\":$outboundPackets}".toByteArray(Charsets.UTF_8)
+                                        channel.send(DataChannel.Buffer(ByteBuffer.wrap(data), false))
+                                    }
+                                }
+                                remotePackets[id]?.takeIf { now - it.second < 6000L }?.let { remoteSent = it.first }
+                                val transceiver = audioTransceiver(pc)
+                                val receiver = transceiver?.receiver?.track() as? AudioTrack
+                                val senderHealthy = transceiver == null || transceiver.sender.track()?.id() == localAudioTrack?.id() ||
+                                    transceiver.sender.setTrack(localAudioTrack, false)
+                                if (receiver?.state() == MediaStreamTrack.State.LIVE) {
+                                    remoteAudioTracks[id] = receiver
+                                    applyRemoteVolume(id, receiver)
+                                }
+                                val broken = !senderHealthy || transceiver == null || receiver?.state() == MediaStreamTrack.State.ENDED ||
+                                    (pc.signalingState() == PeerConnection.SignalingState.STABLE && transceiver.currentDirection != RtpTransceiver.RtpTransceiverDirection.SEND_RECV)
+                                health.getOrPut(id) { VoiceHealth() }.observe(now, inboundPackets, remoteSent, broken)?.let { recoverPeer(id, it) }
+                            }
                             val last = lastAudioStatsLogAt[id] ?: 0L
                             if (now - last >= 5_000L) {
                                 lastAudioStatsLogAt[id] = now
                                 Log.i(TAG, "RTP audio stats[$id]: inboundBytes=$inboundBytes inboundPackets=$inboundPackets inboundLost=$inboundLost outboundBytes=$outboundBytes outboundPackets=$outboundPackets audioLevel=$level")
                             }
+                            } catch (error: Exception) { Log.w(TAG, "语音统计检查失败[$id]", error) }
+                          }
                         }
                     }
                 }
@@ -216,6 +288,12 @@ class AndroidRtcController(private val context: Context) {
                 .setAudioBufferCallback { buffer, audioFormat, channelCount, sampleRate, bytesRead, captureTimestampNs ->
                     runCatching { VoiceProcessor.process(audioFormat, channelCount, sampleRate, buffer, bytesRead) }
                     runCatching { LocalVqePcmProcessor.processCapture(buffer, audioFormat, channelCount, sampleRate, bytesRead) }
+                    // Defense in depth: no captured PCM can leave through WebRTC
+                    // while a chat voice recording owns the microphone.
+                    if (voiceRecordingSuppressed) {
+                        val output = buffer.duplicate()
+                        for (index in 0 until minOf(bytesRead, output.remaining())) output.put(index, 0.toByte())
+                    }
                     captureTimestampNs
                 }
                 .createAudioDeviceModule()
@@ -240,9 +318,10 @@ class AndroidRtcController(private val context: Context) {
         resetAudioRouting()
     }
 
+    @Synchronized
     fun setMicEnabled(enabled: Boolean) {
         _micEnabled.value = enabled
-        localAudioTrack?.setEnabled(enabled)
+        localAudioTrack?.setEnabled(enabled && !voiceRecordingSuppressed)
         // 开麦时进入通话模式(回声消除/合适增益)；关麦时回到普通模式，避免压低提示音音量
         resetAudioRouting()
         sendSignal?.invoke(SignalingEnvelope(type = "status-update", clientId = localPlayerId, micEnabled = enabled))
@@ -272,20 +351,17 @@ class AndroidRtcController(private val context: Context) {
      */
     fun connectToPlayer(remotePlayerId: String) {
         if (remotePlayerId == localPlayerId) return
+        knownPeers.add(remotePlayerId)
+        peerStartedAt.putIfAbsent(remotePlayerId, android.os.SystemClock.elapsedRealtime())
         peerConnections[remotePlayerId]?.let { existing ->
             val state = runCatching { existing.connectionState() }.getOrNull()
             if (state == PeerConnection.PeerConnectionState.CONNECTED ||
                 state == PeerConnection.PeerConnectionState.CONNECTING
             ) return
-            removePeer(remotePlayerId)
+            closePeer(remotePlayerId)
         }
         if (localPlayerId > remotePlayerId) {
-            val pc = ensurePeer(remotePlayerId) ?: return
-            pc.createOffer(object : SimpleSdpObserver() {
-                override fun onCreateSuccess(desc: SessionDescription) {
-                    setLocalOfferAndSend(remotePlayerId, pc, desc)
-                }
-            }, MediaConstraints())
+            forceOffer(remotePlayerId)
         }
         // 否则等待对方发起 offer
     }
@@ -303,28 +379,48 @@ class AndroidRtcController(private val context: Context) {
      * - 无视「ID 字典序较大者才发起」的规则，由点击方强制发起 Offer，
      *   保证点击的人一定能把连接重新建起来。
      *
-     * 注意：调用方需同时向对端发送 voice-reconnect 信令，让对端也拆掉旧连接，
-     * 否则一端沿用旧连接会因指纹/ufrag 不匹配出现「已连接却没有声音」。
+     * 通知、延迟和冲突仲裁都由控制器统一管理。
      */
     fun reconnectPeer(remotePlayerId: String) {
-        if (remotePlayerId == localPlayerId) return
-        Log.i(TAG, "语音重连[$remotePlayerId]：销毁旧连接并强制发起 Offer")
-        removePeer(remotePlayerId)
-        forceOffer(remotePlayerId)
+        recoverPeer(remotePlayerId, "manual", manual = true)
+    }
+
+    private fun recoverPeer(id: String, reason: String, manual: Boolean = false) {
+        if (id !in knownPeers || id == localPlayerId || recoveryJobs[id]?.isActive == true) return
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (!manual && now - (recoveryAt[id] ?: -30_000L) < 30_000L) return
+        recoveryAt[id] = now
+        Log.w(TAG, "恢复语音[$id]: $reason")
+        recoveryJobs[id] = rtcScope.launch {
+            sendSignal?.invoke(SignalingEnvelope(type = "voice-reconnect", from = localPlayerId, to = id))
+            delay(300)
+            if (id !in knownPeers) return@launch
+            closePeer(id)
+            forceOffer(id)
+            delay(3000)
+        }
     }
 
     /** 强制向指定玩家发起 Offer（不受字典序限制，供语音重连使用） */
     private fun forceOffer(remotePlayerId: String) {
         val pc = ensurePeer(remotePlayerId) ?: return
-        pc.createOffer(object : SimpleSdpObserver() {
-            override fun onCreateSuccess(desc: SessionDescription) {
-                setLocalOfferAndSend(remotePlayerId, pc, desc)
-            }
-        }, MediaConstraints())
+        if (pc.signalingState() != PeerConnection.SignalingState.STABLE || !makingOffers.add(remotePlayerId)) return
+        pc.createOffer(sdpObserver(remotePlayerId, pc, created = { desc ->
+            setLocalOfferAndSend(remotePlayerId, pc, desc)
+        }), MediaConstraints())
     }
 
     fun ensurePeer(remotePlayerId: String): PeerConnection? {
         peerConnections[remotePlayerId]?.let { return it }
+        val token = Any()
+        peerTokens[remotePlayerId] = token
+        fun dispatch(action: () -> Unit) {
+            rtcScope.launch {
+                if (peerTokens[remotePlayerId] === token) runCatching(action).onFailure {
+                    Log.w(TAG, "语音回调失败[$remotePlayerId]", it)
+                }
+            }
+        }
         // 同一 EasyTier 虚拟子网内靠 host 候选即可直连；仅保留可达的国内 STUN 兜底，
         // 移除被墙的 Google STUN（否则每次 ICE 收集都要等它超时，拖慢语音建立/重连）
         val iceServers = listOf(
@@ -340,6 +436,7 @@ class AndroidRtcController(private val context: Context) {
             },
             object : PeerConnection.Observer {
                 override fun onIceCandidate(candidate: IceCandidate) {
+                  dispatch {
                     Log.i(TAG, "本地 ICE 候选[$remotePlayerId]: ${candidate.sdp}")
                     sendSignal?.invoke(
                         SignalingEnvelope(
@@ -349,10 +446,12 @@ class AndroidRtcController(private val context: Context) {
                             candidate = IcePayload(candidate.sdp, candidate.sdpMLineIndex, candidate.sdpMid),
                         ),
                     )
+                  }
                 }
 
                 override fun onSignalingChange(newState: PeerConnection.SignalingState) = Unit
                 override fun onIceConnectionChange(newState: PeerConnection.IceConnectionState) {
+                  dispatch {
                     Log.i(TAG, "ICE 连接状态[$remotePlayerId]: $newState")
                     when (newState) {
                         // EasyTier 成员退出时可能短暂重算虚拟路由，多个仍在线连接会同时进入
@@ -364,12 +463,14 @@ class AndroidRtcController(private val context: Context) {
                         PeerConnection.IceConnectionState.COMPLETED -> iceRestartJobs.remove(remotePlayerId)?.cancel()
                         else -> Unit
                     }
+                  }
                 }
                 override fun onIceConnectionReceivingChange(receiving: Boolean) = Unit
                 override fun onIceGatheringChange(newState: PeerConnection.IceGatheringState) {
                     Log.i(TAG, "ICE 收集状态[$remotePlayerId]: $newState")
                 }
                 override fun onConnectionChange(newState: PeerConnection.PeerConnectionState) {
+                  dispatch {
                     Log.i(TAG, "PeerConnection 状态[$remotePlayerId]: $newState")
                     when (newState) {
                         PeerConnection.PeerConnectionState.DISCONNECTED,
@@ -377,11 +478,14 @@ class AndroidRtcController(private val context: Context) {
                         PeerConnection.PeerConnectionState.CONNECTED -> iceRestartJobs.remove(remotePlayerId)?.cancel()
                         else -> Unit
                     }
+                  }
                 }
                 override fun onIceCandidatesRemoved(candidates: Array<out IceCandidate>) = Unit
                 override fun onAddStream(stream: org.webrtc.MediaStream) = Unit
                 override fun onRemoveStream(stream: org.webrtc.MediaStream) = Unit
-                override fun onDataChannel(channel: org.webrtc.DataChannel) = Unit
+                override fun onDataChannel(channel: DataChannel) {
+                    dispatch { if (channel.label() == VOICE_HEALTH_CHANNEL) bindHealthChannel(remotePlayerId, token, channel) }
+                }
                 override fun onRenegotiationNeeded() = Unit
                 override fun onAddTrack(receiver: RtpReceiver, streams: Array<out org.webrtc.MediaStream>) {
                     receiveAudioTrack(receiver.track())
@@ -390,18 +494,25 @@ class AndroidRtcController(private val context: Context) {
                     receiveAudioTrack(transceiver.receiver.track())
                 }
                 private fun receiveAudioTrack(track: MediaStreamTrack?) {
+                  dispatch {
                     if (track is AudioTrack && track.kind() == MediaStreamTrack.AUDIO_TRACK_KIND) {
                         remoteAudioTracks[remotePlayerId] = track
                         applyRemoteVolume(remotePlayerId, track)
                         resetAudioRouting()
                         Log.i(TAG, "收到远端音频轨: $remotePlayerId")
                     }
+                  }
                 }
             },
         )
         if (connection != null) {
             localAudioTrack?.let { connection.addTrack(it, listOf("mctier-stream-$localPlayerId")) }
             peerConnections[remotePlayerId] = connection
+            peerStartedAt[remotePlayerId] = android.os.SystemClock.elapsedRealtime()
+            if (localPlayerId > remotePlayerId) {
+                val init = DataChannel.Init().apply { ordered = false; maxRetransmits = 0 }
+                bindHealthChannel(remotePlayerId, token, connection.createDataChannel(VOICE_HEALTH_CHANNEL, init))
+            }
         }
         return connection
     }
@@ -417,18 +528,36 @@ class AndroidRtcController(private val context: Context) {
             // 随后由对方作为发起方送来全新的 Offer 完成重建。双端同拆同建，
             // 避免一端沿用旧连接导致「已连接却没有声音」。
             "voice-reconnect" -> message.from?.let {
+                if (recoveryJobs[it]?.isActive == true && localPlayerId > it) return@let
+                recoveryJobs.remove(it)?.cancel()
                 Log.i(TAG, "收到来自 $it 的语音重连请求，拆除旧连接等待重建")
-                removePeer(it)
+                closePeer(it)
+                peerStartedAt[it] = android.os.SystemClock.elapsedRealtime()
             }
         }
     }
 
     fun removePeer(playerId: String) {
+        knownPeers.remove(playerId)
+        recoveryJobs.remove(playerId)?.cancel()
+        recoveryAt.remove(playerId)
+        closePeer(playerId)
+        health.remove(playerId)
+        playerVolumes.remove(playerId)
+        peerStartedAt.remove(playerId)
+    }
+
+    private fun closePeer(playerId: String) {
+        peerTokens.remove(playerId)
+        makingOffers.remove(playerId)
         iceRestartJobs.remove(playerId)?.cancel()
-        peerConnections.remove(playerId)?.close()
+        healthChannels.remove(playerId)?.let { it.unregisterObserver(); it.close() }
+        remotePackets.remove(playerId)
+        lastHealthAt.remove(playerId)
+        health[playerId]?.resetSample()
+        peerConnections.remove(playerId)?.let { it.close(); it.dispose() }
         remoteAudioTracks.remove(playerId)
         pendingIceCandidates.remove(playerId)
-        playerVolumes.remove(playerId)
     }
 
     /**
@@ -438,10 +567,15 @@ class AndroidRtcController(private val context: Context) {
      */
     fun resetPeers() {
         Log.i(TAG, "重置所有对等连接（信令重连）")
+        recoveryJobs.values.forEach { it.cancel() }
+        recoveryJobs.clear()
+        peerConnections.keys.toList().forEach(::closePeer)
+        knownPeers.clear()
+        peerStartedAt.clear()
+        health.clear()
+        recoveryAt.clear()
         iceRestartJobs.values.forEach { runCatching { it.cancel() } }
         iceRestartJobs.clear()
-        peerConnections.values.forEach { runCatching { it.close() } }
-        peerConnections.clear()
         remoteAudioTracks.clear()
         pendingIceCandidates.clear()
         audioLevels.clear()
@@ -450,18 +584,11 @@ class AndroidRtcController(private val context: Context) {
     }
 
     fun cleanup() {
+        resetPeers()
         statsJob?.cancel()
         statsJob = null
         audioModeJob?.cancel()
         audioModeJob = null
-        iceRestartJobs.values.forEach { runCatching { it.cancel() } }
-        iceRestartJobs.clear()
-        audioLevels.clear()
-        _speakingPlayers.value = emptySet()
-        peerConnections.values.forEach { it.close() }
-        peerConnections.clear()
-        remoteAudioTracks.clear()
-        pendingIceCandidates.clear()
         playerVolumes.clear()
         localAudioTrack?.dispose()
         audioSource?.dispose()
@@ -476,39 +603,43 @@ class AndroidRtcController(private val context: Context) {
     private fun handleOffer(message: SignalingEnvelope) {
         val from = message.from ?: return
         val offer = message.offer ?: return
+        knownPeers.add(from)
         val pc = ensurePeer(from) ?: return
-        pc.setRemoteDescription(object : SimpleSdpObserver() {
-            override fun onSetSuccess() {
+        val collision = from in makingOffers || pc.signalingState() == PeerConnection.SignalingState.HAVE_LOCAL_OFFER
+        if (collision && localPlayerId > from) return
+        makingOffers.remove(from)
+        val accept = {
+            pc.setRemoteDescription(sdpObserver(from, pc, applied = {
+                makingOffers.remove(from)
+                audioTransceiver(pc)?.let { transceiver ->
+                    transceiver.direction = RtpTransceiver.RtpTransceiverDirection.SEND_RECV
+                    transceiver.sender.setTrack(localAudioTrack, false)
+                }
                 flushPendingIce(from, pc)
-                pc.createAnswer(object : SimpleSdpObserver() {
-                    override fun onCreateSuccess(desc: SessionDescription) {
-                        pc.setLocalDescription(object : SimpleSdpObserver() {
-                            override fun onSetSuccess() {
-                                sendSignal?.invoke(
-                                    SignalingEnvelope(
-                                        type = "answer",
-                                        from = localPlayerId,
-                                        to = from,
-                                        answer = SdpPayload(desc.type.canonicalForm(), desc.description),
-                                    ),
-                                )
-                            }
-                        }, desc)
-                    }
-                }, MediaConstraints())
-            }
-        }, SessionDescription(SessionDescription.Type.OFFER, offer.sdp))
+                pc.createAnswer(sdpObserver(from, pc, created = { desc ->
+                    pc.setLocalDescription(sdpObserver(from, pc, applied = {
+                        sendSignal?.invoke(SignalingEnvelope(type = "answer", from = localPlayerId, to = from,
+                            answer = SdpPayload(desc.type.canonicalForm(), desc.description)))
+                    }), desc)
+                }), MediaConstraints())
+            }), SessionDescription(SessionDescription.Type.OFFER, offer.sdp))
+        }
+        if (pc.signalingState() == PeerConnection.SignalingState.HAVE_LOCAL_OFFER) {
+            pc.setLocalDescription(sdpObserver(from, pc, applied = accept), SessionDescription(SessionDescription.Type.ROLLBACK, ""))
+        } else {
+            // Invalidate a queued local createOffer callback before accepting the remote offer.
+            makingOffers.remove(from)
+            accept()
+        }
     }
 
     private fun handleAnswer(message: SignalingEnvelope) {
         val from = message.from ?: return
         val answer = message.answer ?: return
         peerConnections[from]?.let { pc ->
-            pc.setRemoteDescription(object : SimpleSdpObserver() {
-                override fun onSetSuccess() {
-                    flushPendingIce(from, pc)
-                }
-            }, SessionDescription(SessionDescription.Type.ANSWER, answer.sdp))
+            if (pc.signalingState() != PeerConnection.SignalingState.HAVE_LOCAL_OFFER) return
+            pc.setRemoteDescription(sdpObserver(from, pc, applied = { flushPendingIce(from, pc) }),
+                SessionDescription(SessionDescription.Type.ANSWER, answer.sdp))
         }
     }
 
@@ -517,21 +648,15 @@ class AndroidRtcController(private val context: Context) {
         val candidate = message.candidate ?: return
         val ice = IceCandidate(candidate.sdpMid, candidate.sdpMLineIndex ?: 0, candidate.candidate)
         val pc = peerConnections[from]
-        if (pc == null) {
+        if (shouldQueueVoiceIce(pc?.remoteDescription != null) { pc?.addIceCandidate(ice) == true }) {
             if (!pendingIceCandidates.add(from, ice)) {
                 Log.w(TAG, "丢弃超出限制的待处理 ICE[$from]")
             }
-        } else {
-            runCatching { pc.addIceCandidate(ice) }
-                .onFailure {
-                    if (!pendingIceCandidates.add(from, ice)) {
-                        Log.w(TAG, "丢弃超出限制的待处理 ICE[$from]")
-                    }
-                }
         }
     }
 
     private fun flushPendingIce(playerId: String, pc: PeerConnection) {
+        if (peerConnections[playerId] !== pc || pc.remoteDescription == null) return
         val pending = pendingIceCandidates.remove(playerId).orEmpty()
         pending.forEach { candidate ->
             runCatching { pc.addIceCandidate(candidate) }
@@ -562,15 +687,7 @@ class AndroidRtcController(private val context: Context) {
                 attempt += 1
                 if (attempt >= 3) {
                     Log.w(TAG, "ICE 重启多次未恢复[$remotePlayerId]，重建整条语音连接")
-                    sendSignal?.invoke(
-                        SignalingEnvelope(
-                            type = "voice-reconnect",
-                            from = localPlayerId,
-                            to = remotePlayerId,
-                        ),
-                    )
-                    reconnectPeer(remotePlayerId)
-                    scheduleIceRestart(remotePlayerId, 15_000)
+                    recoverPeer(remotePlayerId, "ice-restarts-exhausted")
                     return@launch
                 }
                 Log.w(TAG, "ICE 自愈重试[$remotePlayerId] 第 $attempt 次，当前状态=$state")
@@ -581,8 +698,10 @@ class AndroidRtcController(private val context: Context) {
     }
 
     private fun setLocalOfferAndSend(remotePlayerId: String, pc: PeerConnection, desc: SessionDescription) {
-        pc.setLocalDescription(object : SimpleSdpObserver() {
-            override fun onSetSuccess() {
+        if (remotePlayerId !in makingOffers || peerConnections[remotePlayerId] !== pc || pc.signalingState() != PeerConnection.SignalingState.STABLE) return
+        pc.setLocalDescription(sdpObserver(remotePlayerId, pc, applied = applied@{
+                if (remotePlayerId !in makingOffers || pc.signalingState() != PeerConnection.SignalingState.HAVE_LOCAL_OFFER) return@applied
+                makingOffers.remove(remotePlayerId)
                 sendSignal?.invoke(
                     SignalingEnvelope(
                         type = "offer",
@@ -591,32 +710,65 @@ class AndroidRtcController(private val context: Context) {
                         offer = SdpPayload(desc.type.canonicalForm(), desc.description),
                     ),
                 )
-            }
-
-            override fun onSetFailure(error: String) {
-                Log.e(TAG, "设置本地 Offer 失败[$remotePlayerId]: $error")
-            }
-        }, desc)
+        }), desc)
     }
 
     private fun restartIce(remotePlayerId: String, pc: PeerConnection) {
+        if (pc.signalingState() != PeerConnection.SignalingState.STABLE || !makingOffers.add(remotePlayerId)) return
         Log.i(TAG, "发起 ICE 重启[$remotePlayerId]")
         val constraints = MediaConstraints().apply {
             mandatory.add(MediaConstraints.KeyValuePair("IceRestart", "true"))
         }
-        pc.createOffer(object : SimpleSdpObserver() {
-            override fun onCreateSuccess(desc: SessionDescription) {
-                setLocalOfferAndSend(remotePlayerId, pc, desc)
-            }
+        pc.createOffer(sdpObserver(remotePlayerId, pc, created = { desc -> setLocalOfferAndSend(remotePlayerId, pc, desc) }), constraints)
+    }
 
-            override fun onCreateFailure(error: String) {
-                Log.e(TAG, "创建 ICE 重启 Offer 失败[$remotePlayerId]: $error")
+    private fun audioTransceiver(pc: PeerConnection): RtpTransceiver? {
+        val audio = pc.transceivers.filter { it.receiver.track()?.kind() == MediaStreamTrack.AUDIO_TRACK_KIND }
+        return audio.firstOrNull { it.mid != null } ?: audio.firstOrNull()
+    }
+
+    private fun sdpObserver(id: String, pc: PeerConnection, created: (SessionDescription) -> Unit = {}, applied: () -> Unit = {}): SimpleSdpObserver =
+        object : SimpleSdpObserver() {
+            override fun onCreateSuccess(desc: SessionDescription) { dispatch { created(desc) } }
+            override fun onSetSuccess() { dispatch(applied) }
+            override fun onCreateFailure(error: String) = failed(error)
+            override fun onSetFailure(error: String) = failed(error)
+            private fun dispatch(action: () -> Unit) {
+                rtcScope.launch {
+                    if (peerConnections[id] === pc) runCatching(action).onFailure { failed(it.message ?: "SDP callback failed") }
+                }
             }
-        }, constraints)
+            private fun failed(error: String) {
+                rtcScope.launch {
+                    if (peerConnections[id] !== pc) return@launch
+                    makingOffers.remove(id)
+                    Log.w(TAG, "语音协商失败[$id]: $error")
+                    recoverPeer(id, "sdp-failure")
+                }
+            }
+        }
+
+    private fun bindHealthChannel(id: String, token: Any, channel: DataChannel) {
+        if (healthChannels.containsKey(id)) { channel.close(); return }
+        healthChannels[id] = channel
+        channel.registerObserver(object : DataChannel.Observer {
+            override fun onBufferedAmountChange(previousAmount: Long) = Unit
+            override fun onStateChange() = Unit
+            override fun onMessage(buffer: DataChannel.Buffer) {
+                if (buffer.binary || buffer.data.remaining() > 128) return
+                val bytes = ByteArray(buffer.data.remaining())
+                buffer.data.get(bytes)
+                val packets = parseVoiceHealth(String(bytes, Charsets.UTF_8)) ?: return
+                rtcScope.launch {
+                    if (peerTokens[id] === token) remotePackets[id] = packets to android.os.SystemClock.elapsedRealtime()
+                }
+            }
+        })
     }
 
     private companion object {
         private const val TAG = "AndroidRtcController"
+        private const val VOICE_HEALTH_CHANNEL = "mctier-voice-health-v1"
         private const val MAX_PENDING_ICE_ENTRIES = 256
         private const val MAX_PENDING_ICE_BYTES = 256 * 1024
         private const val MAX_PENDING_ICE_PER_PEER = 64

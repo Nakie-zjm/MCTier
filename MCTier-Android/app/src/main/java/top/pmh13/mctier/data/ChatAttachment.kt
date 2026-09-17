@@ -40,7 +40,7 @@ fun chatAttachmentKind(meta: ChatAttachmentMeta): String {
         ext in setOf("xls", "xlsx", "ods", "csv", "tsv") -> "sheet"
         ext in setOf("ppt", "pptx", "odp") -> "slides"
         meta.mime.startsWith("text/") || ext in setOf("json", "xml", "js", "ts", "tsx", "jsx", "css", "rs", "kt", "java", "py", "go", "c", "h", "cpp", "hpp", "toml", "yaml", "yml") -> "text"
-        ext in setOf("zip", "rar", "7z", "tar", "gz") -> "archive"
+        ext in setOf("zip", "rar", "7z", "tar", "gz", "tgz", "bz2", "tbz2", "xz", "txz", "zst") -> "archive"
         else -> "other"
     }
 }

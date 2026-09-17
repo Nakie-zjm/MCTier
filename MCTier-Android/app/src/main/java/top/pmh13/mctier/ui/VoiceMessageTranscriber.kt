@@ -1,16 +1,10 @@
 package top.pmh13.mctier.ui
 
 import android.content.Context
-import android.content.Intent
 import android.media.AudioFormat
 import android.media.MediaCodec
 import android.media.MediaExtractor
 import android.media.MediaFormat
-import android.os.Build
-import android.os.ParcelFileDescriptor
-import android.speech.RecognitionListener
-import android.speech.RecognizerIntent
-import android.speech.SpeechRecognizer
 import android.util.Base64
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -18,25 +12,34 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
 import java.io.File
-import java.util.Locale
+import com.k2fsa.sherpa.onnx.OnlineRecognizer
+import com.k2fsa.sherpa.onnx.OnlineRecognizerConfig
+import com.k2fsa.sherpa.onnx.OnlineModelConfig
+import com.k2fsa.sherpa.onnx.OnlineZipformer2CtcModelConfig
 
 private data class DecodedSpeechAudio(val pcm: ByteArray, val sampleRate: Int, val channels: Int)
 
 internal object VoiceMessageTranscriber {
-    fun transcribe(context: Context, dataUrl: String, onResult: (Result<String>) -> Unit) {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
-            onResult(Result.failure(IllegalStateException("Android 13 or newer is required")))
+    private val running = java.util.concurrent.atomic.AtomicBoolean(false)
+    fun transcribe(context: Context, dataUrl: String, onProgress: (String) -> Unit = {}, onResult: (Result<String>) -> Unit) {
+        if (!running.compareAndSet(false, true)) {
+            onResult(Result.failure(IllegalStateException("另一条语音正在识别，请稍后重试")))
             return
         }
         val appContext = context.applicationContext
         CoroutineScope(Dispatchers.IO).launch {
-            val decoded = runCatching { decodeAudio(appContext, dataUrl) }
-            withContext(Dispatchers.Main) {
-                decoded.fold(
-                    onSuccess = { recognizePcm(appContext, it, onResult) },
-                    onFailure = { onResult(Result.failure(it)) },
-                )
+            val handler = android.os.Handler(android.os.Looper.getMainLooper())
+            val result = runCatching {
+                val audio = decodeAudio(appContext, dataUrl)
+                try {
+                    val directory = SpeechModel.prepare(appContext) { completed, total ->
+                        handler.post { onProgress(if (completed < total) L("正在初始化内置语音模型 ${completed * 100 / total}%", "Preparing bundled speech model ${completed * 100 / total}%") else L("正在识别语音…", "Transcribing voice…")) }
+                    }
+                    recognizePcm(directory, audio)
+                } finally { audio.pcm.fill(0) }
             }
+            running.set(false)
+            withContext(Dispatchers.Main) { onResult(result) }
         }
     }
 
@@ -44,10 +47,10 @@ internal object VoiceMessageTranscriber {
         val encoded = Base64.decode(dataUrl.substringAfter("base64,"), Base64.DEFAULT)
         require(encoded.isNotEmpty() && encoded.size <= 2 * 1024 * 1024)
         val source = File.createTempFile("voice-source-", ".audio", context.cacheDir)
-        source.writeBytes(encoded)
         val extractor = MediaExtractor()
         var codec: MediaCodec? = null
         try {
+            source.writeBytes(encoded)
             extractor.setDataSource(source.absolutePath)
             val track = (0 until extractor.trackCount).firstOrNull {
                 extractor.getTrackFormat(it).getString(MediaFormat.KEY_MIME)?.startsWith("audio/") == true
@@ -98,6 +101,7 @@ internal object VoiceMessageTranscriber {
                 }
             }
             require(outputEnded && output.size() > 0)
+            require(!outputFormat.containsKey(MediaFormat.KEY_PCM_ENCODING) || outputFormat.getInteger(MediaFormat.KEY_PCM_ENCODING) == AudioFormat.ENCODING_PCM_16BIT)
             return DecodedSpeechAudio(
                 output.toByteArray(),
                 outputFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE),
@@ -112,49 +116,37 @@ internal object VoiceMessageTranscriber {
         }
     }
 
-    private fun recognizePcm(context: Context, audio: DecodedSpeechAudio, onResult: (Result<String>) -> Unit) {
-        if (!SpeechRecognizer.isRecognitionAvailable(context)) {
-            onResult(Result.failure(IllegalStateException("Speech recognition is unavailable")))
-            return
+    private fun recognizePcm(directory: File, audio: DecodedSpeechAudio): String {
+        require(audio.channels in 1..8 && audio.sampleRate in 8000..192000)
+        val buffer = java.nio.ByteBuffer.wrap(audio.pcm).order(java.nio.ByteOrder.LITTLE_ENDIAN).asShortBuffer()
+        val samples = FloatArray(buffer.remaining() / audio.channels) {
+            var sum = 0f
+            repeat(audio.channels) { sum += buffer.get() / 32768f }
+            sum / audio.channels
         }
-        val source = File.createTempFile("voice-pcm-", ".raw", context.cacheDir).also { it.writeBytes(audio.pcm) }
         audio.pcm.fill(0)
-        val descriptor = ParcelFileDescriptor.open(source, ParcelFileDescriptor.MODE_READ_ONLY)
-        val recognizer = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && SpeechRecognizer.isOnDeviceRecognitionAvailable(context))
-            SpeechRecognizer.createOnDeviceSpeechRecognizer(context)
-        else SpeechRecognizer.createSpeechRecognizer(context)
-        var completed = false
-        fun finish(result: Result<String>) {
-            if (completed) return
-            completed = true
-            runCatching { recognizer.destroy() }
-            runCatching { descriptor.close() }
-            source.delete()
-            onResult(result)
-        }
-        recognizer.setRecognitionListener(object : RecognitionListener {
-            override fun onResults(results: android.os.Bundle) {
-                val text = results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull().orEmpty().trim()
-                if (text.isBlank()) finish(Result.failure(IllegalStateException("No speech recognized"))) else finish(Result.success(text))
+        require(samples.isNotEmpty() && samples.size.toLong() <= audio.sampleRate.toLong() * 120)
+        val recognizer = OnlineRecognizer(config = OnlineRecognizerConfig(enableEndpoint = false, modelConfig = OnlineModelConfig(
+            zipformer2Ctc = OnlineZipformer2CtcModelConfig(model = File(directory, "model.int8.onnx").absolutePath),
+            tokens = File(directory, "tokens.txt").absolutePath, numThreads = 2, provider = "cpu",
+        )))
+        try {
+            val stream = recognizer.createStream()
+            try {
+                var offset = 0
+                while (offset < samples.size) {
+                    val end = minOf(offset + audio.sampleRate, samples.size)
+                    stream.acceptWaveform(samples.copyOfRange(offset, end), audio.sampleRate)
+                    while (recognizer.isReady(stream)) recognizer.decode(stream)
+                    offset = end
+                }
+                // Flush the tail without resetting the accumulated transcript.
+                stream.acceptWaveform(FloatArray((audio.sampleRate * .66).toInt()), audio.sampleRate)
+                stream.inputFinished()
+                while (recognizer.isReady(stream)) recognizer.decode(stream)
+                return recognizer.getResult(stream).text.trim()
             }
-            override fun onError(error: Int) = finish(Result.failure(IllegalStateException("Speech recognition error $error")))
-            override fun onReadyForSpeech(params: android.os.Bundle?) = Unit
-            override fun onBeginningOfSpeech() = Unit
-            override fun onRmsChanged(rmsdB: Float) = Unit
-            override fun onBufferReceived(buffer: ByteArray?) = Unit
-            override fun onEndOfSpeech() = Unit
-            override fun onPartialResults(partialResults: android.os.Bundle?) = Unit
-            override fun onEvent(eventType: Int, params: android.os.Bundle?) = Unit
-        })
-        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault().toLanguageTag())
-            putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
-            putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE, descriptor)
-            putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_CHANNEL_COUNT, audio.channels)
-            putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_ENCODING, AudioFormat.ENCODING_PCM_16BIT)
-            putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_SAMPLING_RATE, audio.sampleRate)
-        }
-        runCatching { recognizer.startListening(intent) }.onFailure { finish(Result.failure(it)) }
+            finally { stream.release() }
+        } finally { samples.fill(0f); recognizer.release() }
     }
 }

@@ -20,6 +20,12 @@ import android.widget.ImageView
 import android.widget.TextView
 import android.widget.Toast
 import java.io.File
+import top.pmh13.mctier.data.MessagePreview
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * 安卓系统级弹幕覆盖层。
@@ -34,6 +40,7 @@ import java.io.File
  * 不影响游戏）；有弹幕飘动时该顶部条可点击；点击条以外区域（含下方游戏区）的触摸照常传给后面的应用。
  */
 object DanmakuOverlay {
+    private val mediaScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     @Volatile var enabled = false
     var fontSizeSp = 20f
     var speedDp = 130f
@@ -189,20 +196,27 @@ object DanmakuOverlay {
     }
 
     /** 推送一条图片弹幕。dataUrl 为 data:image/...;base64,xxx */
-    fun pushImage(label: String, dataUrl: String, color: Int = colorValue) {
+    fun pushImage(label: String, dataUrl: String, color: Int = colorValue, downloadImage: Boolean = true, copyText: String? = null) {
         if (!enabled) return
         val c = container ?: return
         val ctx = appCtx ?: return
         val finalColor = if (rainbow) randomBrightColor() else color
         c.post {
+            if (!enabled || container !== c) return@post
             val bytes = decodeDataUrl(dataUrl)
             if (bytes == null) { push(label, finalColor, null); return@post }
-            val bmp = runCatching { BitmapFactory.decodeByteArray(bytes, 0, bytes.size) }.getOrNull()
-            if (bmp == null) { push(label, finalColor, null); return@post }
+            val drawable = runCatching {
+                if (Build.VERSION.SDK_INT >= 28) android.graphics.ImageDecoder.decodeDrawable(
+                    android.graphics.ImageDecoder.createSource(java.nio.ByteBuffer.wrap(bytes))) { decoder, info, _ ->
+                    val scale = minOf(1f, 320f / info.size.width, 180f / info.size.height)
+                    decoder.setTargetSize((info.size.width * scale).toInt().coerceAtLeast(1), (info.size.height * scale).toInt().coerceAtLeast(1))
+                } else android.graphics.drawable.BitmapDrawable(ctx.resources, BitmapFactory.decodeByteArray(bytes, 0, bytes.size))
+            }.getOrNull()
+            if (drawable == null) { pushCard(label, MessagePreview("image", "[图片预览不可用]")); return@post }
             val d = density()
             // 缩略图大小适中：高度贴合轨道行高，宽度按比例但限制最大值，既能看清又不过度遮挡
             val targetH = (fontSizeSp * 1.55f * d).toInt().coerceIn((26 * d).toInt(), (54 * d).toInt())
-            val ratio = bmp.width.toFloat() / bmp.height.toFloat().coerceAtLeast(1f)
+            val ratio = drawable.intrinsicWidth.toFloat() / drawable.intrinsicHeight.toFloat().coerceAtLeast(1f)
             val maxW = (fontSizeSp * 3.6f * d).toInt()
             val targetW = (targetH * ratio).toInt().coerceIn((targetH * 0.4f).toInt(), maxW)
             // 名字 + 缩略图 横向排布，让用户知道是谁发的图
@@ -219,8 +233,12 @@ object DanmakuOverlay {
                 setTypeface(typeface, android.graphics.Typeface.BOLD)
             }
             val iv = ImageView(ctx).apply {
-                setImageBitmap(bmp)
+                setImageDrawable(drawable)
                 scaleType = ImageView.ScaleType.FIT_CENTER
+                addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
+                    override fun onViewAttachedToWindow(v: View) { (drawable as? android.graphics.drawable.Animatable)?.start() }
+                    override fun onViewDetachedFromWindow(v: View) { (drawable as? android.graphics.drawable.Animatable)?.stop() }
+                })
             }
             row.addView(nameTv, android.widget.LinearLayout.LayoutParams(
                 android.widget.LinearLayout.LayoutParams.WRAP_CONTENT,
@@ -231,7 +249,73 @@ object DanmakuOverlay {
             })
             row.measure(View.MeasureSpec.UNSPECIFIED, View.MeasureSpec.UNSPECIFIED)
             val totalW = row.measuredWidth.coerceAtLeast(targetW)
-            launchBullet(BulletView(ctx, row, isImage = true, copyText = null, imageData = dataUrl), totalW)
+            launchBullet(BulletView(ctx, row, isImage = downloadImage, copyText = copyText, imageData = dataUrl), totalW)
+        }
+    }
+
+    fun pushCard(label: String, preview: MessagePreview) {
+        val c = container ?: return
+        val ctx = appCtx ?: return
+        if (!enabled) return
+        c.post {
+            val icon = when (preview.kind) { "voice" -> "▂▅▃▇▅▂"; "audio" -> "♫"; "video" -> "▶"; "image" -> "▧"; else -> "▤" }
+            val text = "$label $icon ${preview.text}" + if (preview.detail.isNotBlank()) " · ${preview.detail}" else ""
+            val view = TextView(ctx).apply {
+                this.text = text; textSize = fontSizeSp * .85f; setTextColor(Color.WHITE)
+                maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END
+                maxWidth = (ctx.resources.displayMetrics.widthPixels * .85f).toInt()
+                setPadding((10 * density()).toInt(), (4 * density()).toInt(), (10 * density()).toInt(), (4 * density()).toInt())
+                background = android.graphics.drawable.GradientDrawable().apply {
+                    setColor(Color.argb(238, 23, 37, 29)); cornerRadius = 7 * density(); setStroke(1, Color.rgb(113, 164, 85))
+                }
+            }
+            view.measure(View.MeasureSpec.UNSPECIFIED, View.MeasureSpec.UNSPECIFIED)
+            launchBullet(BulletView(ctx, view, false, "${preview.text} ${preview.detail}", null), view.measuredWidth)
+        }
+    }
+
+    fun pushMediaFile(label: String, file: File, preview: MessagePreview) {
+        if (!enabled) return
+        val expectedContainer = container ?: return
+        mediaScope.launch {
+            val image = runCatching {
+                if (preview.kind == "image" && file.length() <= 2 * 1024 * 1024) {
+                    val bytes = file.readBytes()
+                    val mime = top.pmh13.mctier.data.sniffChatImageMime(bytes) ?: error("Unsupported image")
+                    "data:$mime;base64," + Base64.encodeToString(bytes, Base64.NO_WRAP)
+                } else {
+                    val bitmap = if (preview.kind == "video") {
+                        val retriever = android.media.MediaMetadataRetriever()
+                        try {
+                            retriever.setDataSource(file.absolutePath)
+                            if (Build.VERSION.SDK_INT >= 27) retriever.getScaledFrameAtTime(0, android.media.MediaMetadataRetriever.OPTION_CLOSEST_SYNC, 320, 180)
+                            else retriever.getFrameAtTime(0, android.media.MediaMetadataRetriever.OPTION_CLOSEST_SYNC)?.let { original ->
+                                val scale = minOf(1f, 320f / original.width, 180f / original.height)
+                                val scaled = android.graphics.Bitmap.createScaledBitmap(original, (original.width * scale).toInt().coerceAtLeast(1), (original.height * scale).toInt().coerceAtLeast(1), true)
+                                if (scaled !== original) original.recycle()
+                                scaled
+                            }
+                        }
+                        finally { retriever.release() }
+                    } else {
+                        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                        BitmapFactory.decodeFile(file.absolutePath, bounds)
+                        val options = BitmapFactory.Options().apply { inSampleSize = maxOf(1, maxOf(bounds.outWidth / 320, bounds.outHeight / 180)) }
+                        BitmapFactory.decodeFile(file.absolutePath, options)
+                    } ?: error("No preview frame")
+                    try {
+                        val output = java.io.ByteArrayOutputStream()
+                        bitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 82, output)
+                        "data:image/jpeg;base64," + Base64.encodeToString(output.toByteArray(), Base64.NO_WRAP)
+                    } finally { bitmap.recycle() }
+                }
+            }.getOrNull()
+            withContext(Dispatchers.Main) {
+                if (!enabled || container !== expectedContainer) return@withContext
+                if (image != null) pushImage(if (preview.kind == "video") "$label ▶ ${preview.text}" else label, image,
+                    downloadImage = preview.kind == "image", copyText = "${preview.text} ${preview.detail}")
+                else pushCard(label, preview.copy(detail = "${preview.detail} · 预览暂不可用"))
+            }
         }
     }
 

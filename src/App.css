@@ -1379,26 +1379,27 @@ html[data-theme='light'] :is(
   transition: background-color 0.16s ease, border-color 0.16s ease, color 0.16s ease, box-shadow 0.16s ease !important;
 }
 
-html[data-theme='light'] .ant-btn-primary:not(.ant-btn-dangerous):not(.mct-choice-button),
-html[data-theme='light'] .ant-btn-primary:not(.ant-btn-dangerous):not(.mct-choice-button):hover:not(:disabled),
-html[data-theme='light'] .ant-btn-primary:not(.ant-btn-dangerous):not(.mct-choice-button):focus-visible:not(:disabled),
-html[data-theme='light'] .ant-btn-primary:not(.ant-btn-dangerous):not(.mct-choice-button):active:not(:disabled) {
+/* Chat owns both its enabled and disabled send-button palette. */
+html[data-theme='light'] .ant-btn-primary:not(.ant-btn-dangerous):not(.mct-choice-button):not(:where(.send-button)),
+html[data-theme='light'] .ant-btn-primary:not(.ant-btn-dangerous):not(.mct-choice-button):not(:where(.send-button)):hover:not(:disabled),
+html[data-theme='light'] .ant-btn-primary:not(.ant-btn-dangerous):not(.mct-choice-button):not(:where(.send-button)):focus-visible:not(:disabled),
+html[data-theme='light'] .ant-btn-primary:not(.ant-btn-dangerous):not(.mct-choice-button):not(:where(.send-button)):active:not(:disabled) {
   background-image: none !important;
   border-color: #4b941e !important;
   color: #ffffff !important;
 }
 
-html[data-theme='light'] .ant-btn-primary:not(.ant-btn-dangerous):not(.mct-choice-button) {
+html[data-theme='light'] .ant-btn-primary:not(.ant-btn-dangerous):not(.mct-choice-button):not(:where(.send-button)) {
   background-color: #4b941e !important;
 }
 
-html[data-theme='light'] .ant-btn-primary:not(.ant-btn-dangerous):not(.mct-choice-button):hover:not(:disabled),
-html[data-theme='light'] .ant-btn-primary:not(.ant-btn-dangerous):not(.mct-choice-button):focus-visible:not(:disabled) {
+html[data-theme='light'] .ant-btn-primary:not(.ant-btn-dangerous):not(.mct-choice-button):not(:where(.send-button)):hover:not(:disabled),
+html[data-theme='light'] .ant-btn-primary:not(.ant-btn-dangerous):not(.mct-choice-button):not(:where(.send-button)):focus-visible:not(:disabled) {
   background-color: #3f8118 !important;
   border-color: #3f8118 !important;
 }
 
-html[data-theme='light'] .ant-btn-primary:not(.ant-btn-dangerous):not(.mct-choice-button):active:not(:disabled) {
+html[data-theme='light'] .ant-btn-primary:not(.ant-btn-dangerous):not(.mct-choice-button):not(:where(.send-button)):active:not(:disabled) {
   background-color: #367313 !important;
   border-color: #367313 !important;
 }

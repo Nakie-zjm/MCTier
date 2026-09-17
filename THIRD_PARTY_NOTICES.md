@@ -408,3 +408,12 @@ Wintun / WireGuard 相关声明见 §7。
 
 每次升级第三方组件时，MCTier 将同步更新本文件中的：版本号、commit SHA、修改状态、
 补丁文件与二进制 SHA-256，并在发布说明中一并记录。
+
+## 14. 本地文件预览与语音转写 / Local Preview and Transcription
+
+- `@aiden0z/pptx-renderer` 1.3.0 (Apache-2.0): https://github.com/aiden0z/pptx-renderer . Used without source changes to render PPTX slide pages on desktop and Android. Embedded fonts and supported shapes retain their source appearance; complex effects may differ from PowerPoint.
+- `libarchive.js` 2.0.2 (MIT), using libarchive (BSD): https://github.com/nika-begiashvili/libarchivejs . The build inlines WASM and replaces the worker's `import.meta.url` with `self.location.href` for opaque sandbox compatibility. Only archive headers are listed; entries are not extracted.
+- `sherpa-onnx` 1.13.8 (Apache-2.0): https://github.com/k2-fsa/sherpa-onnx . Desktop uses its static Rust/C API; Android uses the official JNI AAR. AAR SHA-256: `633c24321e06b1fe79feafa03ea16cbc0f8a286641e2da3559bac91bdb13bd96`.
+- Zipformer-CTC int8 Chinese model: https://huggingface.co/csukuangfj/sherpa-onnx-streaming-zipformer-small-ctc-zh-int8-2025-04-01 . Both clients bundle gzip-compressed model data and tokens (less than 20,000,000 bytes combined); the revision, extracted sizes and SHA-256 values are pinned in `shared/speech-model.json`. Build machines obtain and verify the assets. Installed clients decompress and verify them locally on first transcription and reuse the verified cache, without network requests. Voice data is processed locally and is not uploaded. This compact model targets Mandarin rather than the previous multilingual SenseVoice model.
+
+Preview engine license texts are bundled with the generated offline viewer assets. The speech model is bundled with the installer as described above. System Office conversion, where available, runs locally with macro automation disabled.

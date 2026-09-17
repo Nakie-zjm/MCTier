@@ -8,7 +8,7 @@
  * so a malicious member could be attributed as anyone else in the same lobby.
  *
  * This module takes the source IP out of the trust chain. Each member generates
- * an ephemeral P-256 key pair for the lifetime of a lobby session and publishes
+ * a locally protected P-256 installation identity and publishes
  * only the public half over its own authenticated signaling WebSocket. Signaling
  * redistributes those public keys as part of the authoritative roster, so a
  * public key always arrives bound to a player id the sender could not forge.
@@ -192,7 +192,7 @@ pub fn random_nonce() -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// The local member's ephemeral signing identity.
+/// The local member's signing identity, protected at rest in production.
 pub struct ChatSigner {
     signing_key: SigningKey,
     public_key_der: Vec<u8>,
@@ -285,10 +285,13 @@ impl ChatSigner {
             .map_err(|_| "Chat authentication failed".into())
     }
 
-    /// Generate a fresh key pair. One is created per lobby session, so leaving
-    /// a lobby permanently retires the credential.
+    /// Generate a fresh identity (also used for isolated test peers).
     pub fn generate() -> Result<Self, String> {
         let signing_key = SigningKey::random(&mut rand::rngs::OsRng);
+        Self::from_signing_key(signing_key)
+    }
+
+    fn from_signing_key(signing_key: SigningKey) -> Result<Self, String> {
         let public_key_der = signing_key
             .verifying_key()
             .to_public_key_der()
@@ -302,6 +305,28 @@ impl ChatSigner {
             key_id,
         })
     }
+
+    /// The private scalar never crosses the native/frontend boundary. A locked
+    /// or damaged credential fails closed instead of silently changing identity.
+    #[cfg(not(test))]
+    pub fn local_identity() -> Result<Self, String> {
+        let entry = keyring::Entry::new("MCTier", "chat-identity-p256-v1")
+            .map_err(|_| "Cannot open chat identity credential")?;
+        match entry.get_secret() {
+            Ok(bytes) => Self::from_signing_key(SigningKey::from_slice(&bytes)
+                .map_err(|_| "Invalid saved chat identity")?),
+            Err(keyring::Error::NoEntry) => {
+                let identity = Self::generate()?;
+                entry.set_secret(&identity.signing_key.to_bytes())
+                    .map_err(|_| "Cannot save chat identity credential")?;
+                Ok(identity)
+            }
+            Err(_) => Err("Chat identity credential is locked or unavailable".into()),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn local_identity() -> Result<Self, String> { Self::generate() }
 
     pub fn public_key_b64(&self) -> String {
         base64_encode(&self.public_key_der)
@@ -552,6 +577,18 @@ mod tests {
             identity_id_for_public_key(&der),
             "signaling identity must be the full public-key fingerprint"
         );
+    }
+
+    #[test]
+    fn restored_identity_keeps_fingerprint_and_new_session_context() {
+        let original = signer();
+        let restored = ChatSigner::from_signing_key(SigningKey::from_slice(&original.signing_key.to_bytes()).unwrap()).unwrap();
+        assert_eq!(original.identity_id(), restored.identity_id());
+        let signature = restored.sign_signaling_registration("new-challenge", "lobby", "10.1.2.3");
+        assert!(verify_signature(&original.public_key_der, &signature,
+            &canonical_signaling_registration("new-challenge", "lobby", "10.1.2.3")));
+        assert!(!verify_signature(&original.public_key_der, &signature,
+            &canonical_signaling_registration("old-challenge", "lobby", "10.1.2.3")));
     }
 
     #[test]

@@ -1,6 +1,8 @@
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 import org.gradle.api.tasks.testing.Test
 import org.gradle.api.tasks.JavaExec
+import java.security.MessageDigest
+import java.net.URI
 
 plugins {
     id("com.android.application")
@@ -15,9 +17,10 @@ android {
 
     defaultConfig {
         applicationId = "top.pmh13.mctier"
+        testInstrumentationRunner = "top.pmh13.mctier.PeerUiInstrumentation"
         minSdk = 26
         targetSdk = 36
-        versionCode = 66
+        versionCode = 73
         versionName = "3.4.0-android"
         ndk {
             // The bundled LocalVQE engine is currently built for the primary
@@ -65,19 +68,37 @@ val syncLicenseAssets by tasks.registering(Sync::class) {
     from(repoRoot.file("LICENSE-LGPL-3.0.txt"))
     from(repoRoot.file("LICENSE-GPL-3.0.txt"))
     from(repoRoot.file("THIRD_PARTY_NOTICES.md"))
+    from(repoRoot.file("shared/speech-model.json"))
     from(repoRoot.file("patches/easytier-2.6.0-mctier-android.patch"))
     into(licenseAssetDir)
 }
 
 android.sourceSets.getByName("main").assets.srcDir(licenseAssetDir)
+val prepareSpeechModel by tasks.registering(Exec::class) {
+    workingDir(rootProject.projectDir.parentFile)
+    commandLine("node", "scripts/prepare-speech-model.mjs")
+    inputs.file(rootProject.projectDir.parentFile.resolve("scripts/prepare-speech-model.mjs"))
+    inputs.file(rootProject.projectDir.parentFile.resolve("shared/speech-model.json"))
+    outputs.dir(rootProject.projectDir.parentFile.resolve("shared/generated/speech-model"))
+}
+android.sourceSets.getByName("main").assets.srcDir(rootProject.projectDir.parentFile.resolve("shared/generated"))
 
 // 仅把目录登记为 assets 源不够：AGP 的资产合并任务不会因此依赖上面的复制任务，
 // 结果是根目录文本更新后 APK 里仍是旧副本（实测 mergeReleaseAssets 直接 UP-TO-DATE）。
 // 这里显式建立依赖，确保每次构建都先同步再合并。
 tasks.matching { it.name.startsWith("merge") && it.name.endsWith("Assets") }.configureEach {
     dependsOn(syncLicenseAssets)
+    dependsOn(prepareSpeechModel)
 }
-tasks.named("preBuild") { dependsOn(syncLicenseAssets) }
+val buildFilePreview by tasks.registering(Exec::class) {
+    workingDir(rootProject.projectDir.parentFile)
+    commandLine("node", "scripts/build-file-preview.mjs")
+    inputs.dir(rootProject.projectDir.parentFile.resolve("shared/file-preview"))
+    inputs.file(rootProject.projectDir.parentFile.resolve("scripts/build-file-preview.mjs"))
+    inputs.file(rootProject.projectDir.parentFile.resolve("package-lock.json"))
+    outputs.file(projectDir.resolve("src/main/assets/file-preview/index.html"))
+}
+tasks.named("preBuild") { dependsOn(syncLicenseAssets, buildFilePreview) }
 
 // Kotlin 2.4 writes JVM test classes to its own tmp directory, while AGP's
 // AndroidUnitTest task discovers classes from the javac output directory.
@@ -105,6 +126,12 @@ val jvmSecurityHardeningTest by tasks.registering(JavaExec::class) {
         fileTree("${gradle.gradleUserHomeDir}/caches/modules-2/files-2.1/org.hamcrest/hamcrest-core") { include("**/*.jar") },
     )
     mainClass.set("org.junit.runner.JUnitCore")
+    args("top.pmh13.mctier.ui.ChatMediaLayoutTest")
+    args("top.pmh13.mctier.ui.ThemeContrastTest")
+    args("top.pmh13.mctier.network.PeerPreferencesTest")
+    args("top.pmh13.mctier.network.VoiceHealthTest")
+    args("top.pmh13.mctier.network.MessagePreviewTest")
+    args("top.pmh13.mctier.ui.SpeechModelTest")
     args("top.pmh13.mctier.network.SecurityHardeningTest", "top.pmh13.mctier.network.ChatOrderTest", "top.pmh13.mctier.network.ChatUnreadTest", "top.pmh13.mctier.network.EncryptedChatTest", "top.pmh13.mctier.network.ImageFormatTest", "top.pmh13.mctier.network.BuiltinEmojiCacheTest", "top.pmh13.mctier.network.EmojiManagementTest", "top.pmh13.mctier.network.ChatAttachmentTest", "top.pmh13.mctier.ui.ChatLinkTest")
 }
 tasks.withType<Test>().matching { it.name == "testDebugUnitTest" }.configureEach {
@@ -122,7 +149,35 @@ kotlin {
     }
 }
 
+val sherpaAar = File(gradle.gradleUserHomeDir, "mctier-libs/sherpa-onnx-1.13.8.aar")
+val prepareSherpa by tasks.registering {
+    val expected = "633c24321e06b1fe79feafa03ea16cbc0f8a286641e2da3559bac91bdb13bd96"
+    outputs.file(sherpaAar)
+    fun valid(file: File): Boolean = file.isFile && file.inputStream().use { input ->
+        val digest = MessageDigest.getInstance("SHA-256")
+        val buffer = ByteArray(65536)
+        while (true) { val count = input.read(buffer); if (count < 0) break; digest.update(buffer, 0, count) }
+        digest.digest().joinToString("") { "%02x".format(it) } == expected
+    }
+    outputs.upToDateWhen { valid(sherpaAar) }
+    doLast {
+        if (!valid(sherpaAar)) {
+            sherpaAar.parentFile.mkdirs()
+            val pending = File(sherpaAar.parentFile, "${sherpaAar.name}.partial")
+            try {
+                val connection = URI("https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.8/${sherpaAar.name}").toURL().openConnection()
+                connection.connectTimeout = 30000
+                connection.readTimeout = 120000
+                connection.getInputStream().use { input -> pending.outputStream().use { output -> input.copyTo(output) } }
+                check(valid(pending)) { "sherpa-onnx AAR checksum mismatch" }
+                pending.copyTo(sherpaAar, overwrite = true)
+            } finally { pending.delete() }
+        }
+    }
+}
+
 dependencies {
+    implementation(files(sherpaAar).builtBy(prepareSherpa))
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20240303")
     implementation(platform("androidx.compose:compose-bom:2025.05.01"))

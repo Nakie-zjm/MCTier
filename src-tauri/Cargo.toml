@@ -16,6 +16,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+embed-resource = "3"
 
 [dependencies]
 tauri = { version = "2", features = ["tray-icon", "protocol-asset"] }
@@ -63,6 +64,9 @@ async-stream = "0.3"
 # ZIP 压缩
 zip = "2"
 calamine = "0.31"
+sherpa-onnx = "=1.13.8"
+flate2 = "1"
+hound = "3.5"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -90,6 +94,7 @@ windows = { version = "0.58", features = [
     "Win32_System_Performance",
     "Win32_System_SystemInformation",
     "Win32_System_Registry",
+    "Win32_System_LibraryLoader",
     "Win32_NetworkManagement_IpHelper",
     "Win32_Networking_WinSock",
 ] }

@@ -8,6 +8,8 @@ import {
   sanitizeUntrustedText,
 } from '../../security/trustBoundary';
 import './DanmakuOverlay.css';
+import type { PreviewKind } from '../../services/danmaku/messagePreview';
+import { FileOutlined, PlayCircleOutlined, AudioOutlined, SoundOutlined } from '@ant-design/icons';
 
 interface Bullet {
   id: number;
@@ -16,7 +18,8 @@ interface Bullet {
   fontSize: number;
   duration: number; // s
   top: number;      // px
-  kind: 'text' | 'image';
+  kind: PreviewKind;
+  detail?: string;
   image?: string;
   copyText?: string;
 }
@@ -28,7 +31,8 @@ interface DanmakuPayload {
   speed: number;
   opacity: number;
   tracks: number;
-  kind?: 'text' | 'image';
+  kind?: PreviewKind;
+  detail?: string;
   image?: string;
   copyText?: string;
 }
@@ -65,7 +69,8 @@ export const DanmakuOverlay: React.FC = () => {
     if (!p || typeof p !== 'object') return;
     const text = sanitizeUntrustedText(p.text, MAX_CHAT_TEXT_LENGTH);
     const image = sanitizeImageDataUrl(p.image);
-    const isImage = p.kind === 'image' && !!image;
+    const kind: PreviewKind = ['image', 'video', 'voice', 'audio', 'file'].includes(p.kind ?? '') ? p.kind! : 'text';
+    const isImage = (kind === 'image' || kind === 'video') && !!image;
     if (!text && !isImage) return;
 
     const vw = window.innerWidth || 1920;
@@ -91,7 +96,7 @@ export const DanmakuOverlay: React.FC = () => {
     const releaseDelay = (estWidth + 30) / speed * 1000;
     trackFreeAt.current[track] = now + releaseDelay;
 
-    const lineHeight = (isImage ? imgH : fontSize) * 1.6;
+    const lineHeight = imgH * 1.6;
     const top = 12 + track * lineHeight;
 
     const bullet: Bullet = {
@@ -101,7 +106,8 @@ export const DanmakuOverlay: React.FC = () => {
       fontSize,
       duration,
       top,
-      kind: isImage ? 'image' : 'text',
+      kind,
+      detail: sanitizeUntrustedText(p.detail, 200),
       image,
       copyText: sanitizeUntrustedText(p.copyText, MAX_CHAT_TEXT_LENGTH),
     };
@@ -264,17 +270,23 @@ export const DanmakuOverlay: React.FC = () => {
             }}
             onAnimationEnd={() => removeBullet(b.id)}
           >
-            {b.kind === 'image' && b.image ? (
+            {(b.kind === 'image' || b.kind === 'video') && b.image ? (
               <>
                 {b.text && <span className="danmaku-name">{b.text}</span>}
-                <img className="danmaku-img" src={b.image} alt="img" style={{ height: `${b.fontSize * 1.55}px`, maxWidth: `${b.fontSize * 3.6}px` }} draggable={false} />
+                <span className="danmaku-visual"><img className="danmaku-img" src={b.image} alt={b.kind === 'video' ? '视频预览' : '图片'} style={{ height: `${b.fontSize * 1.55}px`, maxWidth: `${b.fontSize * 3.6}px` }} draggable={false} />{b.kind === 'video' && <PlayCircleOutlined className="danmaku-video-mark" />}</span>
               </>
+            ) : b.kind !== 'text' ? (
+              <span className="danmaku-media-card">
+                {b.kind === 'voice' ? <AudioOutlined /> : b.kind === 'audio' ? <SoundOutlined /> : b.kind === 'video' ? <PlayCircleOutlined /> : <FileOutlined />}
+                <span><span>{b.text}</span>{b.detail && <small>{b.detail}</small>}</span>
+                {b.kind === 'voice' && <span className="danmaku-wave" aria-hidden>▂▅▃▇▅▂</span>}
+              </span>
             ) : (
               <span>{b.text}</span>
             )}
             {paused && (
               <div className="danmaku-actions" ref={actionBtnRef}>
-                {b.kind === 'image' ? (
+                {b.kind === 'image' && b.image ? (
                   <button className="danmaku-action-btn" onClick={() => doDownload(b)}>{tl('下载图片', 'Download')}</button>
                 ) : (
                   <button className="danmaku-action-btn" onClick={() => doCopy(b)}>{tl('复制内容', 'Copy')}</button>

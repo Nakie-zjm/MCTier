@@ -1,14 +1,18 @@
 import React, { useState, useEffect, useLayoutEffect, useRef, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Input, Button } from 'antd';
+import { Input, Button, Dropdown } from 'antd';
+import { BellOutlined, PushpinOutlined } from '@ant-design/icons';
+import { sortPrivatePeers, notificationUnreadCount } from '../../services/chat/peerPreferences';
 import { AudioOutlined, CloseOutlined, CopyOutlined, DeleteOutlined, DownloadOutlined, FileOutlined, LoadingOutlined, MessageOutlined, PaperClipOutlined, PlusOutlined, RollbackOutlined, SearchOutlined, SendOutlined } from '@ant-design/icons';
 import { convertFileSrc, invoke } from '@tauri-apps/api/core';
 import { useAppStore } from '../../stores';
 import { p2pChatService } from '../../services/chat/P2PChatService';
 import { isWithinRecallWindow, RECALL_WINDOW_MS } from '../../services/chat/recallPolicy';
 import { EmojiPicker } from '../EmojiPicker/EmojiPicker';
+import { MessageContextMenu } from './MessageContextMenu';
 import { EmojiIcon, PauseIcon, PlayIcon } from '../icons';
 import { Avatar } from '../Avatar/Avatar';
+import { ImageViewer } from '../Avatar/ImageViewer';
 import { saveAvatarData } from '../../services/avatar/avatarService';
 import { createChatMessageId } from '../../services/chat/messageOrder';
 import { unreadLabel } from '../../services/chat/unread';
@@ -21,12 +25,14 @@ import './ChatRoom.css';
 
 const { TextArea } = Input;
 import { useHoldVoice } from '../../hooks/useHoldVoice';
-import { safeVoiceUrl, voiceDataUrl } from '../../services/chat/voiceMessage';
+import { safeVoiceUrl, voiceDataUrl, voiceMetadata } from '../../services/chat/voiceMessage';
 import { fileToChatImageDataUrl } from '../../services/chat/imageData';
 import { addDataUrlAsEmoji, type EmojiItem } from '../../services/emoji/emojiLibrary';
 import { chatFileKind, formatFileSize, parseChatAttachment, previewOfficeFile, type ChatAttachment, type ChatFileKind } from '../../services/chat/fileAttachment';
 import { transcribeVoiceMessage } from '../../services/chat/voiceTranscription';
 import { showFeedback } from '../../services/ui/feedback';
+import { voiceBubbleWidth, nonEmptySheets } from '../../services/chat/mediaLayout';
+import { LocalFilePreview } from './LocalFilePreview';
 const replyMarkerPattern = /^\[reply:([^\]]+)]\s*/;
 
 const parseReplyContent = (content: string) => {
@@ -60,10 +66,10 @@ const fuzzyMatch = (value: string, query: string) => {
   return cursor === needle.length;
 };
 
-const VoiceMessageBubble: React.FC<{ src: string; own: boolean; duration?: number }> = ({ src, own }) => {
+export const VoiceMessageBubble: React.FC<{ src: string; own: boolean; duration?: number }> = ({ src, own, duration: initialDuration = 0 }) => {
   const audioRef = useRef<HTMLAudioElement>(null);
   const [playing, setPlaying] = useState(false);
-  const [duration, setDuration] = useState(0);
+  const [duration, setDuration] = useState(initialDuration);
   const [currentTime, setCurrentTime] = useState(0);
   const toggle = () => {
     const audio = audioRef.current;
@@ -73,16 +79,16 @@ const VoiceMessageBubble: React.FC<{ src: string; own: boolean; duration?: numbe
   };
   const seek = (event: React.PointerEvent<HTMLSpanElement>) => {
     const audio = audioRef.current;
-    if (!audio || !Number.isFinite(audio.duration) || audio.duration <= 0) return;
+    if (!audio || duration <= 0) return;
     const bounds = event.currentTarget.getBoundingClientRect();
     const fraction = Math.max(0, Math.min(1, (event.clientX - bounds.left) / bounds.width));
-    audio.currentTime = fraction * audio.duration;
+    audio.currentTime = fraction * duration;
     setCurrentTime(audio.currentTime);
   };
   const progress = duration > 0 ? currentTime / duration : 0;
   return (
-    <div className={`voice-message-bubble${own ? ' own' : ' other'}`}>
-      <audio ref={audioRef} src={src} preload="metadata" onLoadedMetadata={(e) => setDuration(e.currentTarget.duration || 0)} onTimeUpdate={(e) => setCurrentTime(e.currentTarget.currentTime)} onEnded={() => { setPlaying(false); setCurrentTime(0); }} />
+    <div className={`voice-message-bubble${own ? ' own' : ' other'}`} style={{ width: voiceBubbleWidth(duration) }}>
+      <audio ref={audioRef} src={src || undefined} preload="metadata" onLoadedMetadata={(e) => { if (Number.isFinite(e.currentTarget.duration) && e.currentTarget.duration > 0) setDuration(e.currentTarget.duration); }} onTimeUpdate={(e) => setCurrentTime(e.currentTarget.currentTime)} onEnded={() => { setPlaying(false); setCurrentTime(0); }} />
       <button type="button" className="voice-message-play" onClick={toggle} aria-label={playing ? tl('暂停语音', 'Pause voice') : tl('播放语音', 'Play voice')}>
         {playing ? <PauseIcon size={15} /> : <PlayIcon size={15} />}
       </button>
@@ -193,15 +199,17 @@ const ChatImageBubble: React.FC<{
 );
 
 const FileDocumentViewer: React.FC<{ kind: ChatFileKind; sections: string[] }> = ({ kind, sections }) => {
+  if (kind === 'sheet') sections = nonEmptySheets(sections);
   if (kind === 'word') return <article className="office-word-page">{sections.map((paragraph, index) => <p key={index}>{paragraph}</p>)}</article>;
   if (kind === 'slides') return <div className="office-slide-deck">{sections.map((section, index) => {
     const lines = section.split('\n').filter((line) => line.trim() && !/^--- \d+ ---$/.test(line.trim()));
     return <section className="office-slide" key={index}><span className="office-slide-number">{index + 1}</span>{lines[0] && <h3>{lines[0]}</h3>}<div>{lines.slice(1).map((line, lineIndex) => <p key={lineIndex}>{line}</p>)}</div></section>;
   })}</div>;
   if (kind === 'sheet') return <div className="office-workbook">{sections.map((section, index) => {
+    const sheetNumber = section.match(/^--- (\d+) ---/)?.[1] ?? String(index + 1);
     const lines = section.split('\n').filter((line) => !/^--- \d+ ---$/.test(line.trim()));
     const rows = lines.map((line) => line.split('\t'));
-    return <section className="office-sheet" key={index}><header>{tl(`工作表 ${index + 1}`, `Sheet ${index + 1}`)}</header><div><table><tbody>{rows.map((row, rowIndex) => <tr key={rowIndex}>{row.map((cell, cellIndex) => <td key={cellIndex}>{cell}</td>)}</tr>)}</tbody></table></div></section>;
+    return <section className="office-sheet" key={index}><header>{tl(`工作表 ${sheetNumber}`, `Sheet ${sheetNumber}`)}</header><div><table><tbody>{rows.map((row, rowIndex) => <tr key={rowIndex}>{row.map((cell, cellIndex) => <td key={cellIndex}>{cell}</td>)}</tr>)}</tbody></table></div></section>;
   })}</div>;
   return <pre className="office-text-preview">{sections.join('\n')}</pre>;
 };
@@ -214,6 +222,9 @@ export const ChatRoom: React.FC = () => {
   const [chatTab, setChatTab] = useState<'lobby' | 'private'>('lobby');
   const [privatePeerId, setPrivatePeerId] = useState<string>('');
   const unreadChatMessages = useAppStore((state) => state.unreadChatMessages);
+  const peerPreferences = useAppStore((state) => state.peerPreferences);
+  const setPeerPreference = useAppStore((state) => state.setPeerPreference);
+  const [peerMenuId, setPeerMenuId] = useState<string | null>(null);
   const setActiveChatConversation = useAppStore((state) => state.setActiveChatConversation);
   const conversation = chatTab === 'lobby' ? 'lobby' : privatePeerId ? `private:${privatePeerId}` : null;
   const conversationMessages = React.useMemo(() => chatMessages.filter(message => chatTab === 'private'
@@ -244,8 +255,6 @@ export const ChatRoom: React.FC = () => {
   const [searchCursor, setSearchCursor] = useState(0);
   const [isUploading, setIsUploading] = useState(false);
   const [previewImage, setPreviewImage] = useState<{ src: string; name: string; download?: () => void } | null>(null);
-  const [previewZoom, setPreviewZoom] = useState(1);
-  const [previewPan, setPreviewPan] = useState({ x: 0, y: 0 });
   const [downloadingImageId, setDownloadingImageId] = useState<string | null>(null);
   const [downloadedImages, setDownloadedImages] = useState<Map<string, string>>(new Map());
   const [attachmentPaths, setAttachmentPaths] = useState<Map<string, string>>(new Map());
@@ -276,7 +285,6 @@ export const ChatRoom: React.FC = () => {
   const textAreaRef = useRef<any>(null);
   // 输入法组合会话标记：候选词面板打开期间的回车属于输入法，不能当作发送。
   const composingRef = useRef(false);
-  const previewDragRef = useRef<{ pointerId: number; x: number; y: number } | null>(null);
   const messageRefs = useRef<Map<string, HTMLDivElement>>(new Map());
   const highlightTimerRef = useRef<number | null>(null);
   const highlightStartTimerRef = useRef<number | null>(null);
@@ -284,6 +292,7 @@ export const ChatRoom: React.FC = () => {
 
   useLayoutEffect(() => {
     setReplyTo(null);
+    setShowEmojiPicker(false);
     setMentionOpen(false);
     setLastReadMessageIndex(conversationMessages.length);
     setIsAtBottom(true);
@@ -331,9 +340,6 @@ export const ChatRoom: React.FC = () => {
     return () => window.clearTimeout(timeout);
   }, [chatMessages, currentPlayerId, recallClock]);
 
-  useEffect(() => {
-    if (previewZoom <= 1) setPreviewPan({ x: 0, y: 0 });
-  }, [previewZoom]);
 
   useEffect(() => setSearchCursor(0), [searchQuery, conversation]);
 
@@ -344,7 +350,7 @@ export const ChatRoom: React.FC = () => {
   const hasUnreadMessages = unreadMessages.length > 0;
   const unreadConversations = Object.values(unreadChatMessages);
   const privateUnreadFor = (playerId: string) => unreadConversations.filter(value => value === `private:${playerId}`).length;
-  const privateUnread = unreadConversations.filter(value => value.startsWith('private:')).length;
+  const privateUnread = notificationUnreadCount(Object.fromEntries(Object.entries(unreadChatMessages).filter(([, value]) => value.startsWith('private:'))), peerPreferences, players.map(p => p.id));
   const lobbyUnread = unreadConversations.filter(value => value === 'lobby').length;
 
   // 获取MiniWindow的已读消息标记函数
@@ -438,6 +444,18 @@ export const ChatRoom: React.FC = () => {
       ? config.avatarData
       : players.find((player) => player.id === message.playerId)?.avatarData
   );
+
+  // Follow the bottom as the composer/picker resizes, without interrupting
+  // someone reading older messages. ResizeObserver also covers multiline input.
+  useLayoutEffect(() => {
+    const element = messagesContainerRef.current;
+    if (!element) return;
+    const observer = new ResizeObserver(() => {
+      if (isAtBottomRef.current) element.scrollTop = element.scrollHeight;
+    });
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [conversation]);
 
   // 首次进入聊天室：在浏览器绘制前直接把滚动条置底（避免出现"从顶部滚到底部"的可见过程）。
   // 注意依赖 chatMessages.length：消息可能在挂载后才异步载入，确保有消息时才初始化一次，
@@ -767,7 +785,9 @@ export const ChatRoom: React.FC = () => {
     setFilePreview({ message, file: attachment, url: '', kind, loading: true });
     try {
       const { url } = await fetchAttachmentPath(message);
-      if (kind === 'text' || kind === 'word' || kind === 'sheet' || kind === 'slides') {
+      if (kind === 'archive' || (kind === 'slides' && attachment.name.toLowerCase().endsWith('.pptx'))) {
+        setFilePreview({ message, file: attachment, url, kind, loading: false });
+      } else if (kind === 'text' || kind === 'word' || kind === 'sheet' || kind === 'slides') {
         const response = await fetch(url);
         if (!response.ok) throw new Error('ATTACHMENT_CACHE_READ_FAILED');
         const blob = await response.blob();
@@ -783,7 +803,7 @@ export const ChatRoom: React.FC = () => {
               const pdfPath = await invoke<string>('preview_office_attachment', { ownerPlayerId: message.playerId, attachment });
               setFilePreview({ message, file: attachment, url: convertFileSrc(pdfPath), kind: 'pdf', loading: false });
             } catch (nativeError) {
-              if (['doc', 'ppt', 'rtf'].includes(extension)) throw nativeError;
+              if (kind === 'slides' || ['doc', 'ppt', 'rtf'].includes(extension)) throw nativeError;
               const sections = (await previewOfficeFile(blob, kind, attachment.name)).sections;
               setFilePreview({ message, file: attachment, url, kind, loading: false, sections });
             }
@@ -929,7 +949,11 @@ export const ChatRoom: React.FC = () => {
     if (!safeVoiceUrl(message.imageData)) return;
     setVoiceTranscripts((current) => new Map(current).set(message.id, { loading: true }));
     try {
-      const text = (await transcribeVoiceMessage(message.imageData, navigator.language)).trim();
+      const text = (await transcribeVoiceMessage(message.imageData, navigator.language, (completed, total) => {
+        setVoiceTranscripts(current => new Map(current).set(message.id, { loading: true, text: completed < total
+          ? tl(`正在初始化内置语音模型 ${Math.floor(completed * 100 / total)}%`, `Preparing bundled speech model ${Math.floor(completed * 100 / total)}%`)
+          : tl('正在识别语音…', 'Transcribing voice…') }));
+      })).trim();
       setVoiceTranscripts((current) => new Map(current).set(message.id, {
         loading: false,
         text: text || tl('未识别到清晰的语音内容', 'No clear speech was recognized'),
@@ -938,7 +962,7 @@ export const ChatRoom: React.FC = () => {
       console.error('语音转文字失败:', error);
       setVoiceTranscripts((current) => new Map(current).set(message.id, {
         loading: false,
-        error: tl('语音识别失败，请检查系统语音服务后重试', 'Transcription failed. Check the system speech service and try again.'),
+        error: typeof error === 'string' ? error : tl('离线语音识别失败，请重试', 'Offline transcription failed. Please try again.'),
       }));
       showFeedback('error', tl('语音转文字失败', 'Voice transcription failed'));
     }
@@ -1096,15 +1120,30 @@ export const ChatRoom: React.FC = () => {
         {chatTab === 'private' && !privatePeerId && (
           <div className="private-peer-list">
             <div className="private-peer-list-title">{tl('选择要私聊的玩家', 'Choose a player to message')}</div>
-            {players.filter((p) => p.id !== currentPlayerId).map((p) => {
+            {sortPrivatePeers(players.filter((p) => p.id !== currentPlayerId), peerPreferences).map((p) => {
               const unread = privateUnreadFor(p.id);
-              return <button type="button" className="private-peer-item" key={p.id} onClick={() => {
-                setPrivatePeerId(p.id);
-              }}>
+              const preference = peerPreferences[p.id];
+              return <Dropdown key={p.id} trigger={['contextMenu']} open={peerMenuId === p.id}
+                onOpenChange={(open) => setPeerMenuId(current => open ? p.id : current === p.id ? null : current)} menu={{ items: [
+                  { key: 'pin', icon: <PushpinOutlined />, label: preference?.pinned ? tl('取消置顶', 'Unpin') : tl('置顶', 'Pin') },
+                  { key: 'unread', icon: <MessageOutlined />, label: tl('标记未读', 'Mark unread') },
+                  { key: 'mute', icon: <BellOutlined />, label: preference?.muted ? tl('关闭免打扰', 'Disable Do Not Disturb') : tl('设置免打扰', 'Do Not Disturb') },
+                ], onClick: ({ key }) => {
+                  const patch = key === 'pin' ? { pinned: !preference?.pinned } : key === 'mute' ? { muted: !preference?.muted } : { markedUnread: true };
+                  if (setPeerPreference(p.id, patch)) showFeedback('success', tl('私信设置已保存', 'Conversation preference saved'));
+                  setPeerMenuId(null);
+                } }}>
+              <div className={`private-peer-item${preference?.pinned ? ' is-pinned' : ''}`}>
                 <Avatar name={p.name} avatarData={p.avatarData} size={38} />
-                <span>{p.name}</span>
-                {unread > 0 && <span className={`private-peer-unread ${unread >= 10 ? 'pill' : ''}`}>{unread > 99 ? '99+' : unread}</span>}
-              </button>;
+                <button type="button" className="private-peer-open" onClick={() => setPrivatePeerId(p.id)}
+                  onKeyDown={(e) => { if (e.key === 'ContextMenu' || (e.shiftKey && e.key === 'F10')) { e.preventDefault(); setPeerMenuId(p.id); } }}>
+                  <span>{p.name}</span>
+                  {preference?.pinned && <PushpinOutlined title={tl('已置顶', 'Pinned')} />}
+                  {preference?.muted && <BellOutlined title={tl('免打扰', 'Do Not Disturb')} />}
+                  {unread > 0 ? <span className={`private-peer-unread ${unread >= 10 ? 'pill' : ''} ${preference?.muted ? 'muted' : ''}`}>{unread > 99 ? '99+' : unread}</span>
+                    : preference?.markedUnread && <span className={`private-peer-marked${preference?.muted ? ' muted' : ''}`} aria-label={tl('未读', 'Unread')} />}
+                </button>
+              </div></Dropdown>;
             })}
           </div>
         )}
@@ -1174,12 +1213,12 @@ export const ChatRoom: React.FC = () => {
                     <span className="message-recalled-text message-text-body">{tl('此消息已撤回', 'This message was recalled')}</span>
                   ) : message.type === 'voice' && safeVoiceUrl(message.imageData) ? (
                     <div className={`voice-message-stack${isOwnMessage ? ' own' : ' other'}`}>
-                      <VoiceMessageBubble src={message.imageData} own={isOwnMessage} />
+                      <VoiceMessageBubble src={message.imageData} own={isOwnMessage} duration={voiceMetadata(message.content)?.duration} />
                       {voiceTranscripts.has(message.id) && (() => {
                         const transcript = voiceTranscripts.get(message.id)!;
                         return <div className={`voice-transcript-inline${transcript.error ? ' error' : ''}`} aria-live="polite">
                           {transcript.loading
-                            ? <><LoadingOutlined /><span>{tl('正在识别语音…', 'Transcribing voice…')}</span></>
+                            ? <><LoadingOutlined /><span>{transcript.text || tl('正在识别语音…', 'Transcribing voice…')}</span></>
                             : <span>{transcript.error || transcript.text}</span>}
                         </div>;
                       })()}
@@ -1195,7 +1234,7 @@ export const ChatRoom: React.FC = () => {
                         return <ChatImageBubble
                           src={source}
                           name={file.name}
-                          onOpen={() => { setPreviewZoom(1); setPreviewPan({ x: 0, y: 0 }); setPreviewImage({ src: source, name: file.name, download: () => void downloadFileMessage(message) }); }}
+                          onOpen={() => { setPreviewImage({ src: source, name: file.name, download: () => void downloadFileMessage(message) }); }}
                           onDownload={() => void downloadFileMessage(message)}
                         />;
                       }
@@ -1211,7 +1250,7 @@ export const ChatRoom: React.FC = () => {
                     <ChatImageBubble
                       src={imageData}
                       name={tl('聊天图片', 'Chat image')}
-                      onOpen={() => { setPreviewZoom(1); setPreviewPan({ x: 0, y: 0 }); setPreviewImage({ src: imageData, name: tl('聊天图片', 'Chat image'), download: () => void handleDownloadImage(imageData, message.id) }); }}
+                      onOpen={() => { setPreviewImage({ src: imageData, name: tl('聊天图片', 'Chat image'), download: () => void handleDownloadImage(imageData, message.id) }); }}
                       onDownload={() => void handleDownloadImage(imageData, message.id)}
                       onLoad={() => { if (isAtBottom) { try { scrollToBottom(); } catch { /* ignore */ } } }}
                       downloading={downloadingImageId === message.id}
@@ -1277,15 +1316,7 @@ export const ChatRoom: React.FC = () => {
       </div>
 
       {messageContextMenu && (
-        <div
-          className="chat-message-context-menu"
-          style={{
-            left: Math.min(messageContextMenu.x, Math.max(8, window.innerWidth - 196)),
-            top: Math.min(messageContextMenu.y, Math.max(8, window.innerHeight - 428)),
-          }}
-          onMouseDown={(event) => event.stopPropagation()}
-          onContextMenu={(event) => event.preventDefault()}
-        >
+        <MessageContextMenu x={messageContextMenu.x} y={messageContextMenu.y}>
           {!messageContextMenu.message.recalled && (
             <button type="button" className="chat-message-context-item" onClick={() => {
               handleQuoteMessage(messageContextMenu.message);
@@ -1359,7 +1390,7 @@ export const ChatRoom: React.FC = () => {
             <DeleteOutlined />
             <span>{tl('删除消息', 'Delete message')}</span>
           </button>
-        </div>
+        </MessageContextMenu>
       )}
       
       {/* 新消息提示 */}
@@ -1383,64 +1414,7 @@ export const ChatRoom: React.FC = () => {
       
       {/* ??????? */}
       <AnimatePresence>
-        {previewImage && (
-          <motion.div
-            className="image-preview-modal"
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            onClick={() => setPreviewImage(null)}
-          >
-            <button
-              type="button"
-              className="image-preview-close"
-              title={tl('关闭图片预览', 'Close image preview')}
-              aria-label={tl('关闭图片预览', 'Close image preview')}
-              onClick={(event) => { event.stopPropagation(); setPreviewImage(null); }}
-            >
-              <CloseOutlined />
-            </button>
-            <div className="image-preview-content" onClick={(e) => e.stopPropagation()}>
-              <div
-                className="image-preview-stage"
-                onWheel={(e) => {
-                  e.preventDefault();
-                  setPreviewZoom((z) => Math.min(4, Math.max(0.5, z + (e.deltaY < 0 ? 0.15 : -0.15))));
-                }}
-                onPointerDown={(e) => {
-                  if (previewZoom <= 1) return;
-                  previewDragRef.current = { pointerId: e.pointerId, x: e.clientX, y: e.clientY };
-                  e.currentTarget.setPointerCapture(e.pointerId);
-                }}
-                onPointerMove={(e) => {
-                  const drag = previewDragRef.current;
-                  if (!drag || drag.pointerId !== e.pointerId) return;
-                  setPreviewPan((pan) => ({ x: pan.x + e.clientX - drag.x, y: pan.y + e.clientY - drag.y }));
-                  previewDragRef.current = { ...drag, x: e.clientX, y: e.clientY };
-                }}
-                onPointerUp={(e) => {
-                  if (previewDragRef.current?.pointerId === e.pointerId) previewDragRef.current = null;
-                  if (e.currentTarget.hasPointerCapture(e.pointerId)) e.currentTarget.releasePointerCapture(e.pointerId);
-                }}
-                onPointerCancel={() => { previewDragRef.current = null; }}
-              >
-                <img
-                  src={previewImage.src}
-                  alt={previewImage.name}
-                  onDoubleClick={() => { setPreviewZoom(1); setPreviewPan({ x: 0, y: 0 }); }}
-                  draggable={false}
-                  style={{ transform: `translate(${previewPan.x}px, ${previewPan.y}px) scale(${previewZoom})` }}
-                />
-              </div>
-              <div className="image-preview-actions">
-                <button type="button" onClick={() => setPreviewZoom((z) => Math.max(0.5, z - 0.25))}>-</button>
-                <button type="button" onClick={() => { setPreviewZoom(1); setPreviewPan({ x: 0, y: 0 }); }}>{Math.round(previewZoom * 100)}%</button>
-                <button type="button" onClick={() => setPreviewZoom((z) => Math.min(4, z + 0.25))}>+</button>
-              </div>
-              {previewImage.download && <button type="button" className="image-preview-download" onClick={(event) => { event.stopPropagation(); previewImage.download?.(); }}><DownloadOutlined />{tl('下载', 'Download')}</button>}
-            </div>
-          </motion.div>
-        )}
+        {previewImage && <ImageViewer key={previewImage.src} {...previewImage} onClose={() => setPreviewImage(null)} />}
       </AnimatePresence>
 
       <AnimatePresence>
@@ -1453,6 +1427,7 @@ export const ChatRoom: React.FC = () => {
                 : filePreview.kind === 'audio' ? <FileAudioBubble src={filePreview.url} file={filePreview.file} own={false} />
                 : filePreview.kind === 'video' ? <FileVideoPlayer src={filePreview.url} name={filePreview.file.name} />
                 : filePreview.kind === 'pdf' ? <iframe className="file-preview-pdf" src={filePreview.url} title={filePreview.file.name} />
+                : filePreview.kind === 'slides' || filePreview.kind === 'archive' ? <LocalFilePreview key={filePreview.file.id} url={filePreview.url} name={filePreview.file.name} kind={filePreview.kind} />
                 : filePreview.sections ? <FileDocumentViewer kind={filePreview.kind} sections={filePreview.sections} />
                 : <div className="file-preview-status">{tl('此格式暂无内嵌内容视图，可通过消息右键菜单下载后使用系统应用打开。', 'This format has no embedded content view. Download it from the message menu and open it with a system app.')}</div>}
             </div>
@@ -1461,11 +1436,10 @@ export const ChatRoom: React.FC = () => {
       </AnimatePresence>
 
       {/* Emoji选择器 */}
-      {showEmojiPicker && (
+      {showEmojiPicker && (chatTab !== 'private' || privatePeerId) && (
         <div className="emoji-picker-container">
           <EmojiPicker 
             onSelect={handleEmojiSelect}
-            onClose={() => setShowEmojiPicker(false)}
           />
         </div>
       )}
@@ -1535,8 +1509,8 @@ export const ChatRoom: React.FC = () => {
           
           <Button
             type="text"
-            icon={<PaperClipOutlined />}
-            onClick={() => void handleFileUpload()}
+            icon={<PaperClipOutlined style={{ fontSize: 22 }} />}
+            onClick={() => { setShowEmojiPicker(false); void handleFileUpload(); }}
             loading={isUploading}
             title={tl('发送文件', 'Send file')}
             className="file-button"
@@ -1546,6 +1520,8 @@ export const ChatRoom: React.FC = () => {
             {...voice.handlers}
             ref={textAreaRef}
             value={inputValue}
+            onFocus={() => setShowEmojiPicker(false)}
+            onClick={() => setShowEmojiPicker(false)}
             onChange={handleInputChange}
             onKeyDown={handleKeyDown}
             onCompositionStart={() => { composingRef.current = true; }}

@@ -206,8 +206,8 @@ pub struct ChatService {
     session: Arc<RwLock<Option<ChatSession>>>,
     rate_limiter: Arc<Mutex<HashMap<RateLimitKey, VecDeque<Instant>>>>,
     replay_guard: Arc<Mutex<ReplayGuard>>,
-    /// Signing identity for the current lobby session. Recreated on every
-    /// session so leaving a lobby retires the key permanently.
+    /// Protected installation identity loaded for the current lobby. Clearing
+    /// a session disables signing; tokens and replay state still rotate.
     signer: Arc<RwLock<Option<Arc<ChatSigner>>>>,
     attachments: Arc<RwLock<HashMap<String, LocalChatAttachment>>>,
 }
@@ -286,7 +286,7 @@ impl ChatService {
         if let Some(signer) = slot.as_ref() {
             return Ok(signer.public_key_b64());
         }
-        let signer = Arc::new(ChatSigner::generate()?);
+        let signer = Arc::new(ChatSigner::local_identity()?);
         let encoded = signer.public_key_b64();
         *slot = Some(signer);
         Ok(encoded)
@@ -495,8 +495,8 @@ impl ChatService {
             .and_then(|session| session.host_id.clone())
     }
 
-    /// Clearing a session is a security boundary: the signing key is retired
-    /// and the replay window is forgotten along with the roster.
+    /// Clearing a session removes its authorization and in-memory signer.
+    /// Rejoining reloads the protected identity but requires fresh registration.
     pub fn clear_session(&self) {
         *self.session.write() = None;
         *self.signer.write() = None;

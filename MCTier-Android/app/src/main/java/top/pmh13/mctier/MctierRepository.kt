@@ -1,5 +1,7 @@
 package top.pmh13.mctier
 
+import top.pmh13.mctier.data.messagePreview
+
 import android.content.Context
 import android.content.Intent
 import android.graphics.BitmapFactory
@@ -46,6 +48,8 @@ import top.pmh13.mctier.data.AvailableUpdate
 import top.pmh13.mctier.data.DefaultSignalingServer
 import top.pmh13.mctier.data.RemovedQingyunNode
 import top.pmh13.mctier.data.MctierJson
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.encodeToString
 import top.pmh13.mctier.data.MctierWireJson
 import top.pmh13.mctier.data.Lobby
 import top.pmh13.mctier.data.Player
@@ -109,7 +113,10 @@ data class MctierUiState(
     val lobby: Lobby? = null,
     val players: List<Player> = emptyList(),
     val chatMessages: List<ChatMessage> = emptyList(),
+    val chatReady: Boolean = false,
+    val chatConnectionError: String? = null,
     val unreadChatMessages: Map<String, String> = emptyMap(),
+    val peerPreferences: Map<String, top.pmh13.mctier.data.PeerPreference> = emptyMap(),
     val sharedFolders: List<SharedFolder> = emptyList(),
     val remoteShares: List<top.pmh13.mctier.data.RemoteShareEntry> = emptyList(),
     val screenShares: List<ScreenShareInfo> = emptyList(),
@@ -228,8 +235,37 @@ class MctierRepository(private val context: Context) {
     private var activeChatConversation: String? = null
     fun setChatConversation(conversation: String?) {
         activeChatConversation = conversation
+        if (appForeground && conversation?.startsWith("private:") == true) {
+            val id = conversation.removePrefix("private:")
+            _state.value.peerPreferences[id]?.takeIf { it.markedUnread }?.let { setPeerPreference(id, it.copy(markedUnread = false)) }
+        }
         if (appForeground) _state.update { it.copy(unreadChatMessages = readConversation(it.unreadChatMessages, conversation)) }
     }
+
+    fun setPeerPreference(id: String, value: top.pmh13.mctier.data.PeerPreference): Boolean {
+        return runCatching {
+            val updated = top.pmh13.mctier.data.updatePeerPreference(_state.value.peerPreferences, id, value)
+            check(prefs.edit().putString("private_peer_preferences_v1", Json.encodeToString(updated)).commit())
+            _state.update { it.copy(peerPreferences = updated) }
+            true
+        }.getOrElse {
+            _state.update { it.copy(error = L("无法保存私信设置", "Unable to save conversation preference")) }
+            false
+        }
+    }
+
+    private fun localChatIdentity(): ChatAuth.ChatSigner? = runCatching {
+        val key = "chat_identity_p256_v1"
+        if (prefs.contains(key)) {
+            val saved = org.json.JSONObject(securePrefs.getString(key) ?: error("Identity unavailable"))
+            ChatAuth.ChatSigner.restore(saved.getString("privateKey"), saved.getString("publicKey")) ?: error("Invalid identity")
+        } else {
+            val signer = ChatAuth.ChatSigner.generate() ?: error("Key generation failed")
+            val saved = org.json.JSONObject().put("privateKey", signer.privateKeyBase64()).put("publicKey", signer.publicKeyBase64()).toString()
+            check(securePrefs.putString(key, saved)) { "Cannot save identity" }
+            signer
+        }
+    }.getOrNull()
 
     /** 返回当前进程最近的 Logcat 内容，供用户反馈问题时查看或分享。 */
     suspend fun readApplicationLogs(): String = withContext(Dispatchers.IO) {
@@ -308,6 +344,8 @@ class MctierRepository(private val context: Context) {
 
     private val _state = MutableStateFlow(
         MctierUiState(
+            peerPreferences = runCatching { Json.decodeFromString<Map<String, top.pmh13.mctier.data.PeerPreference>>(prefs.getString("private_peer_preferences_v1", "{}") ?: "{}")
+                .filterKeys { it.matches(Regex("[a-f0-9]{64}")) } }.getOrDefault(emptyMap()),
             settings = loadSettings(),
             favorites = loadFavorites(),
             recentLobbies = loadRecentLobbies(),
@@ -325,7 +363,7 @@ class MctierRepository(private val context: Context) {
 
     init {
         clearAvatarCacheOnStartup()
-        if (cachedBuiltinEmojiItems.isEmpty()) syncBuiltinEmoji()
+        if (!builtinEmojiCache.isComplete()) syncBuiltinEmoji()
         scope.launch { signalingClient.events.collect { handleSignal(it) } }
         // 应用已保存的音效/免打扰设置
         soundManager.applySettings(_state.value.settings)
@@ -374,6 +412,11 @@ class MctierRepository(private val context: Context) {
             }
         }
         scope.launch { rtcController.micEnabled.collect { enabled -> _state.update { it.copy(micEnabled = enabled) } } }
+        scope.launch {
+            signalingClient.connectionError.collect { error ->
+                _state.update { it.copy(chatConnectionError = error) }
+            }
+        }
         // 监听信令连接状态：断线后重连时，重置所有语音连接并重发共享，避免重连后语音/共享失效
         scope.launch {
             var wasConnected = false
@@ -383,6 +426,7 @@ class MctierRepository(private val context: Context) {
                 if (connected) {
                     _state.update { it.copy(reconnecting = false) }
                 } else if (_state.value.state == AppConnectionState.InLobby) {
+                    _state.update { it.copy(chatReady = false) }
                     invalidatePendingRemoteControlAccept()
                     remoteControlController?.handleSignalingDisconnected()
                     reconnectNoticeJob = scope.launch {
@@ -553,7 +597,7 @@ class MctierRepository(private val context: Context) {
         }
         val current = _state.value
         val settings = current.settings
-        val signer = ChatAuth.ChatSigner.generate()
+        val signer = localChatIdentity()
         if (signer == null) {
             _state.update { it.copy(error = L("无法生成信令身份密钥", "Unable to generate signaling identity key")) }
             return
@@ -684,6 +728,10 @@ class MctierRepository(private val context: Context) {
                 val activeSigner = chatClient?.signingSigner() ?: return@runCatching
                 if (!isCurrentLobbyGeneration(generation)) return@runCatching
                 serverSessionGeneration = null
+                // Publish the local lobby before asynchronous registration callbacks.
+                _state.update { it.copy(playerId = identityId, lobby = lobby, chatReady = false, chatConnectionError = null,
+                    players = listOf(Player(id = identityId, name = settings.playerName, avatarData = it.settings.avatarData,
+                        virtualIp = lobby.virtualIp, virtualDomain = lobby.virtualDomain, useDomain = lobby.useDomain))) }
                 signalingClient.connect(
                     ConnectArgs(
                         url = lobby.signalingServer,
@@ -701,17 +749,7 @@ class MctierRepository(private val context: Context) {
                     it.copy(
                         playerId = identityId,
                         state = AppConnectionState.InLobby,
-                        lobby = lobby,
-                        players = listOf(
-                            Player(
-                                id = identityId,
-                                name = settings.playerName,
-                                avatarData = it.settings.avatarData,
-                                virtualIp = lobby.virtualIp,
-                                virtualDomain = lobby.virtualDomain,
-                                useDomain = lobby.useDomain,
-                            ),
-                        ),
+                        lobby = it.lobby ?: lobby,
                     )
                 }
                 recordRecentLobby(lobby.name, lobby.password, effectiveNode, effectiveSignaling)
@@ -751,6 +789,8 @@ class MctierRepository(private val context: Context) {
                 lobby = null,
                 players = emptyList(),
                 chatMessages = emptyList(),
+                chatReady = false,
+                chatConnectionError = null,
                 unreadChatMessages = emptyMap(),
                 sharedFolders = emptyList(),
                 remoteShares = emptyList(),
@@ -839,13 +879,7 @@ class MctierRepository(private val context: Context) {
     fun reconnectPlayerVoice(targetId: String) {
         val selfId = _state.value.playerId
         if (targetId.isBlank() || targetId == selfId) return
-        // 通知对端拆除旧连接（旧版本客户端不识别该类型时会忽略，退化为单端重建）
-        signalingClient.send(SignalingEnvelope(type = "voice-reconnect", from = selfId, to = targetId))
-        // 给对端留出拆除时间后，由本机强制发起新的协商
-        scope.launch {
-            delay(300)
-            rtcController.reconnectPeer(targetId)
-        }
+        rtcController.reconnectPeer(targetId)
     }
 
     /** 设置某玩家音量（0.0~1.0），并记忆到状态 */
@@ -888,24 +922,36 @@ class MctierRepository(private val context: Context) {
         }
     }
 
-    fun sendChat(content: String, recipientId: String? = null) {
+    fun sendChat(content: String, recipientId: String? = null): Boolean {
         val trimmed = content.trim()
-        if (trimmed.isEmpty()) return
+        if (trimmed.isEmpty()) return false
         val current = _state.value
-        val client = chatClient ?: return
-        val wire = client.sendText(current.settings.playerName, trimmed, recipientId) ?: return
+        val client = chatClient
+        if (client == null || !current.chatReady || !client.isReady()) return false
+        val wire = runCatching { client.sendText(current.settings.playerName, trimmed, recipientId) }.getOrNull() ?: return false
         val message = ChatMessage(wire.id, current.playerId, current.settings.playerName, trimmed, wire.timestamp * 1000, mine = true, recipientId = recipientId)
         _state.update { it.copy(chatMessages = orderedChatMessages(it.chatMessages + message)) }
+        return true
     }
+
+    fun suspendLobbyVoiceForRecording(): () -> Unit = rtcController.suspendLobbyVoice()
 
     fun sendVoiceChat(bytes: ByteArray, duration: Double, recipientId: String?) {
         val current = _state.value
-        val client = chatClient ?: return
+        val client = chatClient
+        if (client == null || !current.chatReady || !client.isReady()) {
+            _state.update { it.copy(error = L("语音发送失败：聊天连接尚未就绪", "Voice message failed: chat is not connected")) }
+            return
+        }
         ioScope.launch {
-            val wire = client.sendVoice(current.settings.playerName, bytes, duration, recipientId) ?: return@launch
+            val wire = runCatching { client.sendVoice(current.settings.playerName, bytes, duration, recipientId) }.getOrNull()
+            if (wire == null) {
+                _state.update { it.copy(error = L("语音发送失败，请检查大厅连接后重试", "Voice message failed. Check the lobby connection and retry")) }
+                return@launch
+            }
             val data = "data:audio/wav;base64," + Base64.encodeToString(bytes, Base64.NO_WRAP)
             val message = ChatMessage(wire.id, current.playerId, current.settings.playerName, wire.content, wire.timestamp * 1000, mine = true, type = "voice", imageBase64 = data, recipientId = recipientId)
-            _state.update { it.copy(chatMessages = orderedChatMessages(it.chatMessages + message)) }
+            _state.update { if (it.lobby?.id != current.lobby?.id || it.playerId != current.playerId) it else it.copy(chatMessages = orderedChatMessages(it.chatMessages + message)) }
         }
     }
 
@@ -1121,15 +1167,29 @@ class MctierRepository(private val context: Context) {
                 ).filterKeys { id -> id in retainedIds })
             }
         }
-        val isUnread = finalMessage.id in _state.value.unreadChatMessages
+        val isUnread = finalMessage.id in _state.value.unreadChatMessages &&
+            !(finalMessage.recipientId != null && _state.value.peerPreferences[finalMessage.playerId]?.muted == true)
         // 弹幕：他人消息以弹幕飘过屏幕（含游戏中）。
         // 仅当(不在聊天室界面) 或 (App 挂在后台)时才弹幕——已在聊天室且在前台能直接看到消息，无需再弹幕
         if (isUnread) {
             runCatching {
-                if (wire.messageType == "image" && base64 != null) {
+                val preview = messagePreview(finalMessage)
+                if (finalMessage.recalled) return@runCatching
+                if (preview.kind == "image" && base64 != null) {
                     top.pmh13.mctier.ui.DanmakuOverlay.pushImage("$resolvedName:", base64)
+                } else if (wire.messageType == "file" && preview.kind in setOf("image", "video")) {
+                    val sessionClient = chatClient
+                    ioScope.launch {
+                        val file = runCatching { attachment?.let { sessionClient?.fetchAttachment(wire.playerId, it) } }.getOrNull()
+                        if (sessionClient !== chatClient || _state.value.chatMessages.none { it.id == finalMessage.id && !it.recalled } ||
+                            (finalMessage.recipientId != null && _state.value.peerPreferences[finalMessage.playerId]?.muted == true)) return@launch
+                        if (file != null) top.pmh13.mctier.ui.DanmakuOverlay.pushMediaFile("$resolvedName:", file, preview)
+                        else top.pmh13.mctier.ui.DanmakuOverlay.pushCard("$resolvedName:", preview.copy(detail = "${preview.detail} · 预览暂不可用"))
+                    }
+                } else if (preview.kind != "text") {
+                    top.pmh13.mctier.ui.DanmakuOverlay.pushCard("$resolvedName:", preview)
                 } else {
-                    val visibleContent = if (wire.messageType == "file") "[文件] ${attachment?.name.orEmpty()}" else wire.content.replaceFirst(Regex("^> \\[reply:[^]]+]\\s*"), "> ")
+                    val visibleContent = preview.text
                     val dm = "$resolvedName: $visibleContent"
                     top.pmh13.mctier.ui.DanmakuOverlay.push(dm, copyText = visibleContent)
                 }
@@ -1789,12 +1849,13 @@ class MctierRepository(private val context: Context) {
             return false
         }
         client.sendAvatar(state.settings.avatarData)
+        _state.update { it.copy(chatReady = true, chatConnectionError = null) }
         return true
     }
 
     private fun rejectChatProtocol(reason: String) {
         Log.e("MctierRepository", "Rejecting chat protocol state: $reason")
-        _state.update { it.copy(error = reason) }
+        _state.update { it.copy(error = reason, chatReady = false) }
         scope.launch { leaveLobby() }
     }
 
@@ -2959,31 +3020,41 @@ class MctierRepository(private val context: Context) {
         if (builtinEmojiSyncJob?.isActive == true) return
         _state.update { it.copy(emojiBuiltinSyncing = true, emojiBuiltinError = null, emojiBuiltinDownloaded = 0, emojiBuiltinTotal = 0) }
         builtinEmojiSyncJob = ioScope.launch {
-            runCatching { builtinEmojiCache.sync { downloaded, total ->
-                _state.update { it.copy(emojiBuiltinDownloaded = downloaded, emojiBuiltinTotal = total) }
-            } }
-                .onSuccess { builtin ->
-                    withContext(Dispatchers.Main) {
-                        _state.update { current ->
-                            current.copy(
-                                customEmojiItems = builtin + current.customEmojiItems.filterNot { it.categoryId == "builtin" },
-                                emojiBuiltinSyncing = false,
-                                emojiBuiltinError = null,
-                            )
+            var retryDelay = 2_000L
+            while (true) {
+                _state.update { it.copy(emojiBuiltinError = null) }
+                runCatching { builtinEmojiCache.sync { downloaded, total ->
+                    _state.update { it.copy(emojiBuiltinDownloaded = downloaded, emojiBuiltinTotal = total) }
+                } }
+                    .onSuccess { builtin ->
+                        withContext(Dispatchers.Main) {
+                            _state.update { current ->
+                                current.copy(
+                                    customEmojiItems = builtin + current.customEmojiItems.filterNot { it.categoryId == "builtin" },
+                                    emojiBuiltinSyncing = false,
+                                    emojiBuiltinError = null,
+                                )
+                            }
+                        }
+                        return@launch
+                    }
+                    .onFailure { error ->
+                        if (error is kotlinx.coroutines.CancellationException) throw error
+                        Log.w(TAG, "Built-in emoji synchronization failed", error)
+                        val available = builtinEmojiCache.cachedItems()
+                        withContext(Dispatchers.Main) {
+                            _state.update {
+                                it.copy(
+                                    customEmojiItems = available + it.customEmojiItems.filterNot { emoji -> emoji.categoryId == "builtin" },
+                                    emojiBuiltinSyncing = true,
+                                    emojiBuiltinError = error.message ?: "download failed",
+                                )
+                            }
                         }
                     }
-                }
-                .onFailure { error ->
-                    Log.w(TAG, "Built-in emoji synchronization failed", error)
-                    withContext(Dispatchers.Main) {
-                        _state.update {
-                            it.copy(
-                                emojiBuiltinSyncing = false,
-                                emojiBuiltinError = error.message ?: "download failed",
-                            )
-                        }
-                    }
-                }
+                kotlinx.coroutines.delay(retryDelay)
+                retryDelay = (retryDelay * 2).coerceAtMost(60_000L)
+            }
         }
     }
 

@@ -5,8 +5,10 @@
  * - 把聊天消息以事件形式发送给弹幕窗口渲染
  */
 
-import { invoke } from '@tauri-apps/api/core';
+import { convertFileSrc, invoke } from '@tauri-apps/api/core';
 import { emitTo } from '@tauri-apps/api/event';
+import { messagePreview, visualThumbnail, type PreviewKind, type PreviewMessage } from './messagePreview';
+import { parseChatAttachment } from '../chat/fileAttachment';
 
 export interface DanmakuConfig {
   enabled: boolean;
@@ -46,8 +48,9 @@ export interface DanmakuPayload {
   speed: number;
   opacity: number;
   tracks: number;
-  /** 弹幕类型：text=文本，image=图片 */
-  kind?: 'text' | 'image';
+  /** Presentation kind; never pass wire JSON to the overlay. */
+  kind?: PreviewKind;
+  detail?: string;
   /** 图片弹幕的图片数据（data URL） */
   image?: string;
   /** 文本弹幕可复制的原始消息内容（点击弹幕后复制用） */
@@ -57,7 +60,8 @@ export interface DanmakuPayload {
 /** push 的可选项 */
 export interface DanmakuPushOptions {
   color?: string;
-  kind?: 'text' | 'image';
+  kind?: PreviewKind;
+  detail?: string;
   image?: string;
   copyText?: string;
 }
@@ -124,12 +128,32 @@ class DanmakuService {
       kind: o.kind || 'text',
       image: o.image,
       copyText: o.copyText,
+      detail: o.detail,
     };
     try {
       await emitTo('danmaku', 'danmaku-msg', payload);
     } catch (e) {
       console.warn('发送弹幕失败', e);
     }
+  }
+
+  async pushMessage(sender: string, message: PreviewMessage & { playerId: string }, shouldDisplay: () => boolean = () => true): Promise<void> {
+    if (!this.config.enabled || message.recalled || !shouldDisplay()) return;
+    const preview = messagePreview(message);
+    if (message.type === 'file' && (preview.kind === 'image' || preview.kind === 'video')) {
+      const attachment = parseChatAttachment(message.attachment ?? message.content);
+      if (attachment) {
+        try {
+          const path = await invoke<string>('fetch_chat_attachment', { ownerPlayerId: message.playerId, attachment });
+          preview.image = await visualThumbnail(convertFileSrc(path), preview.kind);
+        } catch { preview.detail = `${preview.detail ?? ''} · 预览暂不可用`; }
+      }
+    }
+    if (!shouldDisplay()) return;
+    await this.push(`${sender}: ${preview.kind === 'image' && preview.image ? '' : preview.text}`, {
+      kind: preview.kind, image: preview.image, detail: preview.detail,
+      copyText: preview.kind === 'text' ? preview.text : [preview.text, preview.detail].filter(Boolean).join(' · '),
+    });
   }
 
   /** 预览：临时开启窗口并发送一条示例弹幕（不改变 enabled 持久化状态） */

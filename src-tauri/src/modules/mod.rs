@@ -72,6 +72,7 @@ pub mod mc_lan_bridge;
 
 // 远程控制（输入注入）模块
 pub mod remote_control;
+pub mod speech_transcription;
 
 // Linux 平台支撑（TUN 文件能力 / 网卡检测 / 防火墙 / XDG 自启动）
 #[cfg(target_os = "linux")]

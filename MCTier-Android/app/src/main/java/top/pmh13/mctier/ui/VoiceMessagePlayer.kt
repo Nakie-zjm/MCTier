@@ -5,6 +5,8 @@ import android.media.MediaPlayer
 import android.util.Base64
 import androidx.compose.material3.Text
 import androidx.compose.foundation.background
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -12,7 +14,9 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Pause
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.testTagsAsResourceId
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -23,14 +27,16 @@ import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.input.pointer.pointerInteropFilter
 import androidx.compose.runtime.*
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-internal fun VoiceMessagePlayer(data: String, mine: Boolean) {
+internal fun VoiceMessagePlayer(data: String, mine: Boolean, initialDuration: Float = 0f, onLongClick: () -> Unit = {}) {
     var playing by remember(data) { mutableStateOf(false) }
     val player = remember(data) { MediaPlayer() }
     var ready by remember(data) { mutableStateOf(false) }
     var failed by remember(data) { mutableStateOf(false) }
     var positionMs by remember(data) { mutableIntStateOf(0) }
     var waveWidth by remember { mutableIntStateOf(1) }
+    var durationMs by remember(data) { mutableIntStateOf(0) }
     val lifecycle = androidx.lifecycle.compose.LocalLifecycleOwner.current.lifecycle
     DisposableEffect(player, lifecycle) {
         val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
@@ -56,7 +62,7 @@ internal fun VoiceMessagePlayer(data: String, mine: Boolean) {
                     return count
                 }
             })
-            player.setOnPreparedListener { ready = true }
+            player.setOnPreparedListener { durationMs = it.duration.coerceAtLeast(0); ready = true }
             player.setOnCompletionListener { playing = false; positionMs = 0 }
             player.setOnErrorListener { _, _, _ -> failed = true; playing = false; true }
             player.prepareAsync()
@@ -71,18 +77,23 @@ internal fun VoiceMessagePlayer(data: String, mine: Boolean) {
     }
     val enabled = ready && !failed
     val bubbleColor = if (mine) GrassGreen else PanelHigh
-    val contentColor = if (mine) Color(0xFF06210A) else TextPrimary
+    val contentColor = if (mine) OnAccent else TextPrimary
     val progress = if (ready && player.duration > 0) positionMs.toFloat() / player.duration else 0f
+    val duration = if (durationMs > 0) durationMs / 1000f else initialDuration
     Row(
-        modifier = Modifier.clip(RoundedCornerShape(14.dp)).background(if (enabled) bubbleColor else PanelHigh).padding(horizontal = 7.dp, vertical = 5.dp),
+        modifier = Modifier.semantics { testTagsAsResourceId = true }.testTag("voice-bubble").width(voiceBubbleWidth(duration).dp).height(40.dp).clip(RoundedCornerShape(14.dp)).background(bubbleColor).combinedClickable(onClick = {}, onLongClick = onLongClick).padding(horizontal = 7.dp, vertical = 5.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(7.dp),
     ) {
-        IconButton(enabled = enabled, onClick = { if (playing) player.pause() else player.start(); playing = !playing }, modifier = Modifier.size(26.dp).clip(CircleShape).background(contentColor.copy(alpha = .12f))) {
-            Icon(if (playing) Icons.Rounded.Pause else Icons.Rounded.PlayArrow, contentDescription = if (playing) L("暂停语音", "Pause voice") else L("播放语音", "Play voice"), tint = contentColor, modifier = Modifier.size(16.dp))
+        Box(Modifier.size(30.dp).combinedClickable(enabled = enabled, onClick = {
+            runCatching { if (playing) player.pause() else player.start(); playing = !playing }.onFailure { failed = true }
+        }, onLongClick = onLongClick), contentAlignment = Alignment.Center) {
+            Box(Modifier.size(22.dp).clip(CircleShape).background(contentColor.copy(alpha = .10f)).testTag("voice-play-background"), contentAlignment = Alignment.Center) {
+                Icon(if (playing) Icons.Rounded.Pause else Icons.Rounded.PlayArrow, contentDescription = if (playing) L("暂停语音", "Pause voice") else L("播放语音", "Play voice"), tint = contentColor, modifier = Modifier.size(16.dp))
+            }
         }
         Row(
-            Modifier.width(78.dp).height(20.dp).onSizeChanged { waveWidth = maxOf(1, it.width) }
+            Modifier.weight(1f).height(20.dp).onSizeChanged { waveWidth = maxOf(1, it.width) }
                 .pointerInteropFilter { event ->
                     if (!enabled) return@pointerInteropFilter true
                     if (event.actionMasked == android.view.MotionEvent.ACTION_DOWN || event.actionMasked == android.view.MotionEvent.ACTION_MOVE) {
@@ -93,7 +104,7 @@ internal fun VoiceMessagePlayer(data: String, mine: Boolean) {
                     true
                 },
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(2.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
         ) {
             repeat(14) { index ->
                 Box(
@@ -102,6 +113,6 @@ internal fun VoiceMessagePlayer(data: String, mine: Boolean) {
                 )
             }
         }
-        Text(if (failed) "--" else if (!ready) "..." else "${player.duration / 1000}s", color = contentColor.copy(alpha = .86f), fontSize = 11.sp)
+        Text(if (failed) "--" else "${kotlin.math.ceil(duration.toDouble()).toInt().coerceAtLeast(1)}s", modifier = Modifier.widthIn(min = 24.dp), maxLines = 1, color = contentColor.copy(alpha = .86f), fontSize = 11.sp)
     }
 }

@@ -5,6 +5,7 @@ import { Modal, Spin, Tooltip, App as AntdApp } from 'antd';import { open } from
 import QRCodeLib from 'qrcode';
 import { writeText } from '@tauri-apps/plugin-clipboard-manager';
 import { useAppStore } from '../../stores';
+import { notificationUnreadCount } from '../../services/chat/peerPreferences';
 import { webrtcClient } from '../../services';
 import { audioService } from '../../services';
 import { p2pChatService } from '../../services/chat/P2PChatService';
@@ -388,7 +389,7 @@ export const MiniWindow: React.FC = () => {
   const othersMessageCount = othersMessages.length;
   
   // 计算未读消息数量（只计算其他人的消息）
-  const unreadCount = useAppStore((state) => Object.keys(state.unreadChatMessages).length);
+  const unreadCount = useAppStore((state) => notificationUnreadCount(state.unreadChatMessages, state.peerPreferences, state.players.map(p => p.id)));
   
   // 调试日志 - 详细打印未读消息统计
   useEffect(() => {
@@ -521,27 +522,26 @@ export const MiniWindow: React.FC = () => {
         type: message.type,
         imageData: message.imageData,
         recipientId: message.recipientId,
+        attachment: message.attachment,
+        recalled: message.recalled,
       };
       
       addChatMessage(chatMessage);
+      const privateMuted = !!message.recipientId && !!useAppStore.getState().peerPreferences[message.playerId]?.muted;
 
       // 弹幕：把他人发来的消息以弹幕形式飘过屏幕（自己发的不飘）。
       // 仅当(在聊天室界面 且 主窗口处于前台)时才不弹幕——此时能直接看到消息；
       // 若挂后台(如玩游戏，窗口失焦)则即使开着聊天室也照常弹幕
       const isUnread = useAppStore.getState().unreadChatMessages[message.id] !== undefined;
       const inChatAndFocused = !isUnread && document.hasFocus();
-      if (message.playerId !== currentPlayerId && !inChatAndFocused) {
-        if (message.type === 'image') {
-          void danmakuService.push(`${senderName}:`, {
-            kind: 'image',
-            image: message.imageData,
-          });
-        } else {
-          void danmakuService.push(`${senderName}: ${message.content || ''}`, {
-            kind: 'text',
-            copyText: message.content || '',
-          });
-        }
+      if (message.playerId !== currentPlayerId && !inChatAndFocused && !privateMuted) {
+        const sessionLobby = useAppStore.getState().lobby;
+        void danmakuService.pushMessage(senderName, chatMessage, () => {
+          const state = useAppStore.getState();
+          return state.lobby === sessionLobby &&
+            state.chatMessages.some(item => item.id === chatMessage.id && !item.recalled) &&
+            !(chatMessage.recipientId && state.peerPreferences[chatMessage.playerId]?.muted);
+        });
       }
       
       // 消息提示音逻辑（支持 @ 提及）：
@@ -563,7 +563,7 @@ export const MiniWindow: React.FC = () => {
         // 是否应当触发提示音
         const shouldNotify = !!message.recipientId || !hasMention || mentionsEveryone || mentionsMe;
 
-        if (shouldNotify && isUnread) {
+        if (shouldNotify && isUnread && !privateMuted) {
           console.log('🔔 [MiniWindow] 触发新消息提示音', { hasMention, mentionsMe, mentionsEveryone });
           audioService.play('newMessage').catch((err) => {
             console.error('播放新消息提示音失败:', err);

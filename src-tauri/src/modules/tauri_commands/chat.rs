@@ -621,7 +621,9 @@ pub async fn preview_spreadsheet_attachment(
                         .join("\t")
                 })
                 .collect::<Vec<_>>();
-            sections.push(format!("--- {} ---\n{}", sheet_index + 1, rows.join("\n")));
+            if rows.iter().any(|row| !row.trim().is_empty()) {
+                sections.push(format!("--- {} ---\n{}", sheet_index + 1, rows.join("\n")));
+            }
         }
         if sections.is_empty() {
             return Err("电子表格中没有可预览的工作表".into());
@@ -663,18 +665,22 @@ pub async fn preview_office_attachment(
     #[cfg(windows)]
     {
         const CREATE_NO_WINDOW: u32 = 0x08000000;
-        let script = r#"param([string]$source,[string]$destination,[string]$kind)
+        let script = r#"$source=$env:MCTIER_OFFICE_SOURCE
+$destination=$env:MCTIER_OFFICE_DESTINATION
+$kind=$env:MCTIER_OFFICE_KIND
 $ErrorActionPreference='Stop'
 $application=$null
 $document=$null
 try {
   if ($kind -eq 'word') {
     $application=New-Object -ComObject Word.Application
+    $application.AutomationSecurity=3
     $application.Visible=$false
     $document=$application.Documents.Open($source,$false,$true)
     $document.ExportAsFixedFormat($destination,17)
   } elseif ($kind -eq 'powerpoint') {
     $application=New-Object -ComObject PowerPoint.Application
+    $application.AutomationSecurity=3
     $document=$application.Presentations.Open($source,$true,$false,$false)
     $document.SaveAs($destination,32)
   } else { throw 'Unsupported Office kind' }
@@ -694,9 +700,10 @@ try {
                 "-Command",
                 script,
             ])
-            .arg(&cached)
-            .arg(&output_path)
-            .arg(kind)
+            .env("MCTIER_OFFICE_SOURCE", &cached)
+            .env("MCTIER_OFFICE_DESTINATION", &output_path)
+            .env("MCTIER_OFFICE_KIND", kind)
+            .kill_on_drop(true)
             .creation_flags(CREATE_NO_WINDOW)
             .output(),
         )
@@ -724,6 +731,7 @@ pub async fn transcribe_voice_message(
     wav_data: Vec<u8>,
     language: String,
     app: tauri::AppHandle,
+    progress: tauri::ipc::Channel<crate::modules::speech_transcription::SpeechProgress>,
 ) -> Result<String, String> {
     if wav_data.len() < 44
         || wav_data.len() > 4 * 1024 * 1024
@@ -735,79 +743,7 @@ pub async fn transcribe_voice_message(
     if !matches!(language.as_str(), "zh-CN" | "en-US") {
         return Err("不支持的识别语言".into());
     }
-    let directory = app
-        .path()
-        .app_cache_dir()
-        .map_err(|error| format!("无法获取缓存目录: {error}"))?
-        .join("voice-transcription");
-    tokio::fs::create_dir_all(&directory)
-        .await
-        .map_err(|error| format!("无法创建语音识别缓存: {error}"))?;
-    let wav_path = directory.join(format!("{}.wav", uuid::Uuid::new_v4()));
-    tokio::fs::write(&wav_path, wav_data)
-        .await
-        .map_err(|error| format!("无法准备语音识别数据: {error}"))?;
-
-    #[cfg(windows)]
-    let recognition = {
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        let script = r#"param([string]$cultureName,[string]$wavPath)
-$ErrorActionPreference='Stop'
-[Console]::OutputEncoding=New-Object System.Text.UTF8Encoding($false)
-Add-Type -AssemblyName System.Speech
-$culture=[System.Globalization.CultureInfo]::GetCultureInfo($cultureName)
-$installed=[System.Speech.Recognition.SpeechRecognitionEngine]::InstalledRecognizers()
-$selected=$installed | Where-Object { $_.Culture.Name -eq $culture.Name } | Select-Object -First 1
-if ($null -eq $selected) {
-  $selected=$installed | Where-Object { $_.Culture.TwoLetterISOLanguageName -eq $culture.TwoLetterISOLanguageName } | Select-Object -First 1
-}
-if ($null -eq $selected) { $selected=$installed | Select-Object -First 1 }
-if ($null -eq $selected) { throw 'No Windows speech recognizer is installed' }
-$engine=[System.Speech.Recognition.SpeechRecognitionEngine]::new($selected)
-$grammar=New-Object System.Speech.Recognition.DictationGrammar
-$engine.LoadGrammar($grammar)
-$engine.SetInputToWaveFile($wavPath)
-$parts=New-Object System.Collections.Generic.List[string]
-while ($true) {
-  $result=$engine.Recognize([TimeSpan]::FromSeconds(8))
-  if ($null -eq $result) { break }
-  if ($result.Confidence -ge 0.15 -and -not [string]::IsNullOrWhiteSpace($result.Text)) { $parts.Add($result.Text) }
-}
-$engine.Dispose()
-[Console]::Write(($parts -join ' '))"#;
-        tokio::time::timeout(
-            std::time::Duration::from_secs(45),
-            tokio::process::Command::new(windows_system_command(
-                "WindowsPowerShell\\v1.0\\powershell.exe",
-            ))
-            .args([
-                "-NoLogo",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                script,
-            ])
-            .arg(&language)
-            .arg(&wav_path)
-            .creation_flags(CREATE_NO_WINDOW)
-            .output(),
-        )
-        .await
-        .map_err(|_| "语音识别超时".to_string())?
-        .map_err(|error| format!("无法启动系统语音识别: {error}"))
-    };
-    #[cfg(not(windows))]
-    let recognition: Result<std::process::Output, String> =
-        Err("当前系统暂不支持本地语音转文字".into());
-
-    let _ = tokio::fs::remove_file(&wav_path).await;
-    let output = recognition?;
-    if !output.status.success() {
-        return Err("系统语音识别不可用，请安装对应的语音识别语言".into());
-    }
-    String::from_utf8(output.stdout)
-        .map(|value| value.trim().to_string())
-        .map_err(|_| "系统语音识别返回了无效文本".into())
+    crate::modules::speech_transcription::transcribe(wav_data, app, progress).await
 }
 
 /// 发送P2P聊天消息

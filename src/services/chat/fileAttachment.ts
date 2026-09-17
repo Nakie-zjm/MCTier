@@ -38,7 +38,7 @@ export function chatFileKind(file: ChatAttachment): ChatFileKind {
   if (['xls', 'xlsx', 'xlsb', 'ods', 'csv', 'tsv'].includes(ext)) return 'sheet';
   if (['ppt', 'pptx', 'odp'].includes(ext)) return 'slides';
   if (file.mime.startsWith('text/') || ['json', 'xml', 'js', 'ts', 'tsx', 'jsx', 'css', 'rs', 'kt', 'java', 'py', 'go', 'c', 'h', 'cpp', 'hpp', 'toml', 'yaml', 'yml'].includes(ext)) return 'text';
-  if (['zip', 'rar', '7z', 'tar', 'gz'].includes(ext)) return 'archive';
+  if (['zip', 'rar', '7z', 'tar', 'gz', 'tgz', 'bz2', 'tbz2', 'xz', 'txz', 'zst'].includes(ext)) return 'archive';
   return 'other';
 }
 

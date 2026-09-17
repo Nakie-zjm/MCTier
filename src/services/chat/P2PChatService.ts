@@ -46,6 +46,10 @@ class P2PChatService {
   private historyReconcileTimer: number | null = null;
   private historyReconcileInFlight = false;
   private historySince = 0;
+  private listeningGeneration = 0;
+  private lastFullHistory = 0;
+  private streamWatchdog: number | null = null;
+  private lastStreamActivity = 0;
   private isListening: boolean = false;
   private onMessageCallback?: (message: ChatMessage) => void;
   private peerIps: string[] = [];
@@ -53,6 +57,7 @@ class P2PChatService {
   private myVirtualIp: string = ''; // 本机虚拟IP，用于连接本机聊天服务器
   private chatToken: string = '';
   private seenMessageIds: Set<string> = new Set(); // 基于消息ID去重，避免重复回调
+  private reconciledMessageIds: Set<string> = new Set();
   private seenMessageOrder: string[] = []; // 维护去重集合的插入顺序，便于裁剪
   private pendingRecalls: Map<string, string> = new Map();
   private onAvatarCallback?: (playerId: string, avatarData?: string) => void;
@@ -97,8 +102,7 @@ class P2PChatService {
     this.stopListening();
     this.chatToken = nextToken;
     if (wasListening && nextToken) {
-      this.isListening = true;
-      void this.connectToSelfStream();
+      this.startPolling();
     }
   }
   
@@ -114,9 +118,11 @@ class P2PChatService {
     this.onMessageCallback = undefined;
     this.onAvatarCallback = undefined;
     this.seenMessageIds.clear();
+    this.reconciledMessageIds.clear();
     this.seenMessageOrder = [];
     this.pendingRecalls.clear();
     this.historySince = 0;
+    this.lastFullHistory = 0;
     console.log('🔄 [P2PChatService] 服务已重置');
   }
 
@@ -132,10 +138,17 @@ class P2PChatService {
   }
 
   startPolling(): void {
-    if (this.selfStreamAbortController) return;
     this.isListening = true;
     void this.connectToSelfStream();
     this.scheduleHistoryReconcile();
+    if (!this.streamWatchdog) this.streamWatchdog = window.setInterval(() => {
+      if (!this.isListening) return;
+      if (this.selfStreamAbortController && Date.now() - this.lastStreamActivity > 45000) {
+        this.selfStreamAbortController.abort();
+        this.selfStreamAbortController = null;
+      }
+      if (!this.selfStreamAbortController) void this.connectToSelfStream();
+    }, 10000);
   }
 
   /**
@@ -144,33 +157,49 @@ class P2PChatService {
    * while the stream was being replaced is delivered to the renderer too.
    */
   private scheduleHistoryReconcile(): void {
+    if (!this.isListening) return;
+    const generation = this.listeningGeneration;
     if (this.historyReconcileTimer) window.clearTimeout(this.historyReconcileTimer);
     this.historyReconcileTimer = window.setTimeout(() => {
       this.historyReconcileTimer = null;
-      if (!this.isListening) return;
-      void this.reconcileHistory().finally(() => this.scheduleHistoryReconcile());
+      if (!this.isListening || generation !== this.listeningGeneration) return;
+      void this.reconcileHistory().finally(() => {
+        if (generation === this.listeningGeneration) this.scheduleHistoryReconcile();
+      });
     }, 2500);
   }
 
   private async reconcileHistory(): Promise<void> {
     if (this.historyReconcileInFlight || !this.isListening || !this.currentPlayerId) return;
     this.historyReconcileInFlight = true;
+    const generation = this.listeningGeneration;
+    // Timestamps originate on different peers. Periodic full bounded-history
+    // reads recover messages missed by a cursor advanced by a faster clock.
+    const full = Date.now() - this.lastFullHistory >= 30000;
     try {
       const messages = await invoke<BackendChatMessage[]>('get_p2p_chat_messages', {
         peerIps: this.peerIps,
-        since: Math.max(0, this.historySince - 2),
+        since: full ? null : Math.max(0, this.historySince - 2),
       });
+      if (!this.isListening || generation !== this.listeningGeneration) return;
       if (!Array.isArray(messages)) return;
+      if (full) this.lastFullHistory = Date.now();
+      const snapshotIds = full ? new Set<string>() : null;
       for (const message of messages) {
         if (typeof message.timestamp === 'number' && Number.isFinite(message.timestamp)) {
           this.historySince = Math.max(this.historySince, message.timestamp);
         }
         this.handleMessage(message);
+        const id = sanitizeIdentifier(message.id);
+        if (this.seenMessageIds.has(id) || this.reconciledMessageIds.has(id)) snapshotIds?.add(id);
       }
+      // Multiple peers can contribute more than the rolling 1,000-ID window.
+      // Keep the last bounded snapshot too, so full recovery never replays it.
+      if (snapshotIds) this.reconciledMessageIds = snapshotIds;
     } catch (error) {
       console.warn('⚠️ [P2PChatService] 聊天历史对账失败:', error instanceof Error ? error.message : '请求失败');
     } finally {
-      this.historyReconcileInFlight = false;
+      if (generation === this.listeningGeneration) this.historyReconcileInFlight = false;
     }
   }
 
@@ -193,6 +222,7 @@ class P2PChatService {
     const streamUrl = `http://${this.myVirtualIp}:${CHAT_SERVER_PORT}/api/chat/stream`;
     const controller = new AbortController();
     this.selfStreamAbortController = controller;
+    this.lastStreamActivity = Date.now();
     console.log('📡 [P2PChatService] 连接到本机认证消息流');
 
     try {
@@ -216,12 +246,14 @@ class P2PChatService {
       let buffer = '';
       while (this.isListening && this.selfStreamAbortController === controller) {
         const { done, value } = await reader.read();
+        if (controller.signal.aborted || this.selfStreamAbortController !== controller) return;
         if (done) break;
+        this.lastStreamActivity = Date.now();
         buffer += decoder.decode(value, { stream: true });
         buffer = this.consumeSseFrames(buffer);
       }
       buffer += decoder.decode();
-      this.consumeSseFrames(buffer);
+      if (!controller.signal.aborted && this.selfStreamAbortController === controller) this.consumeSseFrames(buffer);
     } catch (error) {
       if (!controller.signal.aborted && this.isListening) {
         const detail = error instanceof Error ? error.message : '连接失败';
@@ -317,7 +349,7 @@ class P2PChatService {
     ) {
       if (safeMessage.player_id === this.currentPlayerId) return;
       // 按消息 ID 去重：避免对账/SSE 重复投递导致控制消息反复触发（如剪贴板反复弹窗、白板重复笔画）
-      if (this.seenMessageIds.has(safeMessage.id)) return;
+      if (this.seenMessageIds.has(safeMessage.id) || this.reconciledMessageIds.has(safeMessage.id)) return;
       this.seenMessageIds.add(safeMessage.id);
       this.seenMessageOrder.push(safeMessage.id);
       if (this.seenMessageOrder.length > 1000) {
@@ -336,7 +368,7 @@ class P2PChatService {
 
     // 【修复】基于消息ID去重（每条消息ID唯一），避免重复回调；
     // 旧逻辑用“内容相同”去重，会误杀用户连续发送的相同文本（如连续两条“哈哈”）。
-    if (this.seenMessageIds.has(safeMessage.id)) {
+    if (this.seenMessageIds.has(safeMessage.id) || this.reconciledMessageIds.has(safeMessage.id)) {
       console.log('🚫 [P2PChatService] 跳过重复消息（ID相同）');
       return;
     }
@@ -484,6 +516,9 @@ class P2PChatService {
    */
   private stopListening(): void {
     this.isListening = false;
+    this.listeningGeneration++;
+    if (this.streamWatchdog) window.clearInterval(this.streamWatchdog);
+    this.streamWatchdog = null;
 
     if (this.selfReconnectTimer) {
       clearTimeout(this.selfReconnectTimer);

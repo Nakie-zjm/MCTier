@@ -42,9 +42,12 @@ class SignalingClient {
 
     private val _connected = MutableStateFlow(false)
     val connected: StateFlow<Boolean> = _connected
+    private val _connectionError = MutableStateFlow<String?>(null)
+    val connectionError: StateFlow<String?> = _connectionError
 
     fun connect(args: ConnectArgs) {
         require(LobbyInviteCodec.isValidSignalingServer(args.url)) { "Signaling requires WSS" }
+        _connectionError.value = null
         val generation = synchronized(this) {
             connectionGeneration += 1
             connectArgs = args
@@ -90,6 +93,7 @@ class SignalingClient {
     }
 
     fun close() {
+        _connectionError.value = null
         synchronized(this) {
             connectionGeneration += 1
             connectArgs = null
@@ -142,6 +146,7 @@ class SignalingClient {
                                 return@onSuccess
                             }
                             registrationAccepted = true
+                            _connectionError.value = null
                             serverSessionGeneration = assignedGeneration
                             _connected.value = true
                             startHeartbeat()
@@ -167,6 +172,7 @@ class SignalingClient {
                 serverSessionGeneration = null
                 registrationSent = false
                 _connected.value = false
+                _connectionError.value = "WebSocket $code"
                 android.util.Log.w("SignalingClient", "WS onClosed code=$code reason=$reason")
                 scheduleReconnect(args, generation)
             }
@@ -182,6 +188,11 @@ class SignalingClient {
                 serverSessionGeneration = null
                 registrationSent = false
                 _connected.value = false
+                _connectionError.value = when (response?.code) {
+                    525 -> "HTTP 525: SSL handshake failed with origin server"
+                    null -> "Network connection failed"
+                    else -> "HTTP ${response.code}"
+                }
                 android.util.Log.e("SignalingClient", "WS onFailure: ${t.message} resp=${response?.code}")
                 scheduleReconnect(args, generation)
             }

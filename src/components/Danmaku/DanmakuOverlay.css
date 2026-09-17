@@ -42,6 +42,13 @@
   pointer-events: none;
 }
 
+.danmaku-visual { position: relative; display: inline-flex; }
+.danmaku-video-mark { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); color: #fff; filter: drop-shadow(0 1px 3px #000); }
+.danmaku-media-card { display: inline-flex; align-items: center; gap: .5em; padding: .12em .5em; border: 1px solid #a9e57b80; border-radius: .35em; background: #17251ded; color: #fff; font-size: .85em; }
+.danmaku-media-card > span:not(.anticon) { max-width: 22em; overflow: hidden; text-overflow: ellipsis; }
+.danmaku-media-card small { display: block; color: #d0dfc9; font-size: .6em; }
+.danmaku-wave { color: #95ec69; letter-spacing: .08em; }
+
 /* 定住后出现的操作按钮容器（位于弹幕下方） */
 .danmaku-actions {
   position: absolute;

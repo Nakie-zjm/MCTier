@@ -24,6 +24,11 @@ import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.Image
 import androidx.compose.ui.res.painterResource
 import top.pmh13.mctier.R
+import top.pmh13.mctier.data.PeerPreference
+import top.pmh13.mctier.data.sortPrivatePeers
+import top.pmh13.mctier.data.notificationUnreadCount
+import androidx.compose.material.icons.rounded.PushPin
+import androidx.compose.material.icons.rounded.NotificationsOff
 import top.pmh13.mctier.network.LobbyInviteCodec
 import top.pmh13.mctier.network.LobbyInviteData
 import androidx.compose.foundation.background
@@ -192,6 +197,8 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
@@ -245,6 +252,9 @@ import top.pmh13.mctier.network.UpdateChecker
 // —— 主题调色板：用 mutableStateOf 支持的顶层 var，组合内读取后随主题切换实时重组 ——
 internal var GrassGreen by mutableStateOf(Color(0xFF52C41A))
 internal var GrassGreenDark by mutableStateOf(Color(0xFF3C9A12))
+internal var OnAccent by mutableStateOf(Color.Black)
+internal var ChatSendFill by mutableStateOf(Color(0xFF327D1C))
+internal var AccentText by mutableStateOf(Color(0xFF86DD5F))
 internal var DirtBrown by mutableStateOf(Color(0xFFB07C46))
 internal var DirtBrownDeep by mutableStateOf(Color(0xFF8C5A2B))
 internal val DangerRed = Color(0xFFE5484D)
@@ -255,6 +265,10 @@ internal var PanelHigh by mutableStateOf(Color(0xFF2B2B40))
 internal var Hairline by mutableStateOf(Color(0x1FFFFFFF))
 /** 主文本/图标颜色：深色主题=白，浅色主题=近黑（取代原先硬编码的 Color.White） */
 internal var TextPrimary by mutableStateOf(Color(0xFFFFFFFF))
+
+private fun foregroundOn(fill: Color) = Color(foregroundArgb(fill.toArgb()))
+private fun readableAccent(accent: Color, surfaces: List<Color>) =
+    Color(readableAccentArgb(accent.toArgb(), surfaces.map { it.toArgb() }))
 
 // —— 界面语言：顶层 var，切换后所有读取 L(...) 的组合实时重组 ——
 internal var appLang by mutableStateOf("zh")
@@ -308,7 +322,7 @@ private fun darken(c: Color, f: Float = 0.78f): Color =
  * @param primaryHex 自定义主色十六进制（空=默认绿）
  */
 fun applyAppTheme(mode: String, primaryHex: String) {
-    val accent = parseAccent(primaryHex)
+    val accent = parseAccent(primaryHex).copy(alpha = 1f)
     GrassGreen = accent
     GrassGreenDark = darken(accent)
     if (mode == "light") {
@@ -330,6 +344,10 @@ fun applyAppTheme(mode: String, primaryHex: String) {
         DirtBrown = Color(0xFFB07C46)
         DirtBrownDeep = Color(0xFF8C5A2B)
     }
+    OnAccent = foregroundOn(accent)
+    // Send keeps a white icon; darken bright custom accents instead of tinting the icon black.
+    ChatSendFill = readableAccent(accent, listOf(Color.White))
+    AccentText = readableAccent(accent, listOf(Panel, PanelHigh, PageBg, PageBgTop))
 }
 
 @Composable
@@ -352,15 +370,27 @@ fun MctierApp(repository: MctierRepository, onConsentGranted: () -> Unit = {}) {
     }
     var booting by remember { mutableStateOf(true) }
     LaunchedEffect(Unit) { kotlinx.coroutines.delay(1300); booting = false }
-    val accent = GrassGreen
+    val accent = AccentText
     val isLight = state.settings.themeMode == "light"
     val scheme = if (isLight) lightColorScheme(
-        primary = accent, onPrimary = Color(0xFFFFFFFF), secondary = DirtBrown,
+        primary = accent, onPrimary = foregroundOn(accent), secondary = DirtBrown,
+        primaryContainer = PanelHigh, onPrimaryContainer = TextPrimary,
+        secondaryContainer = PanelHigh, onSecondaryContainer = TextPrimary,
+        surfaceContainer = Panel, surfaceContainerHigh = PanelHigh,
+        surfaceContainerLow = Panel, surfaceContainerLowest = PageBg, surfaceContainerHighest = PanelHigh,
+        surfaceDim = PageBg, surfaceBright = Panel, surfaceTint = accent,
+        onSecondary = foregroundOn(DirtBrown),
         background = PageBg, surface = Panel, surfaceVariant = PanelHigh,
         onBackground = TextPrimary, onSurface = TextPrimary,
         onSurfaceVariant = TextPrimary.copy(alpha = 0.7f), error = DangerRed,
     ) else darkColorScheme(
-        primary = accent, onPrimary = Color(0xFFFFFFFF), secondary = DirtBrown,
+        primary = accent, onPrimary = foregroundOn(accent), secondary = DirtBrown,
+        primaryContainer = PanelHigh, onPrimaryContainer = TextPrimary,
+        secondaryContainer = PanelHigh, onSecondaryContainer = TextPrimary,
+        surfaceContainer = Panel, surfaceContainerHigh = PanelHigh,
+        surfaceContainerLow = Panel, surfaceContainerLowest = PageBg, surfaceContainerHighest = PanelHigh,
+        surfaceDim = PageBg, surfaceBright = Panel, surfaceTint = accent,
+        onSecondary = foregroundOn(DirtBrown),
         background = PageBg, surface = Panel, surfaceVariant = PanelHigh,
         onBackground = TextPrimary, onSurface = TextPrimary,
         onSurfaceVariant = TextPrimary.copy(alpha = 0.7f), error = DangerRed,
@@ -1396,7 +1426,7 @@ private fun LobbyScreen(state: MctierUiState, repository: MctierRepository) {
     // 返回键：在子视图时返回大厅（对齐桌面端 ESC 返回上一页）
     BackHandler(enabled = currentView != "lobby") { currentView = "lobby" }
     // 未读消息标记：不在聊天界面时收到新消息则标红
-    val hasUnread = state.unreadChatMessages.isNotEmpty()
+    val hasUnread = notificationUnreadCount(state.unreadChatMessages, state.peerPreferences, state.players.map { it.id }) > 0
 
     Box(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding().padding(horizontal = 16.dp)) {
         AnimatedContent(
@@ -2544,8 +2574,10 @@ private fun ChatTab(state: MctierUiState, repository: MctierRepository) {
     var voiceDrag by remember { mutableStateOf(0f) }
     var voiceHoldJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
     var voiceLongPressTriggered by remember { mutableStateOf(false) }
+    var releaseLobbyVoice by remember { mutableStateOf<(() -> Unit)?>(null) }
     val voiceInputFocus = remember { FocusRequester() }
     val keyboardController = LocalSoftwareKeyboardController.current
+    val chatFocusManager = LocalFocusManager.current
     val cancelVoiceThresholdPx = with(LocalDensity.current) { 60.dp.toPx() }
     val voiceGestureScope = rememberCoroutineScope()
     val microphonePermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -2553,17 +2585,21 @@ private fun ChatTab(state: MctierUiState, repository: MctierRepository) {
     }
     fun finishVoice(cancel: Boolean) {
         val seconds = voiceRecorder.seconds
-        val bytes = voiceRecorder.finish(cancel)
+        val bytes = try { voiceRecorder.finish(cancel) } finally {
+            releaseLobbyVoice?.invoke()
+            releaseLobbyVoice = null
+        }
         recordingVoice = false
         cancelVoice = false
         voiceSeconds = 0
         if (bytes != null) repository.sendVoiceChat(bytes, seconds, if (privateMode) privatePeerId else null)
+        else if (!cancel) android.widget.Toast.makeText(context, L("录音过短或未采集到声音，请按住后再说话", "Recording too short or unavailable. Hold before speaking"), android.widget.Toast.LENGTH_SHORT).show()
     }
-    DisposableEffect(conversation) { onDispose { voiceHoldJob?.cancel(); voiceRecorder.finish(true); recordingVoice = false } }
+    DisposableEffect(conversation) { onDispose { voiceHoldJob?.cancel(); finishVoice(true) } }
     val voiceLifecycle = androidx.lifecycle.compose.LocalLifecycleOwner.current
     DisposableEffect(voiceLifecycle) {
         val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
-            if (event == androidx.lifecycle.Lifecycle.Event.ON_STOP) { voiceRecorder.finish(true); recordingVoice = false }
+            if (event == androidx.lifecycle.Lifecycle.Event.ON_STOP) { voiceHoldJob?.cancel(); finishVoice(true) }
         }
         voiceLifecycle.lifecycle.addObserver(observer)
         onDispose { voiceLifecycle.lifecycle.removeObserver(observer) }
@@ -2633,7 +2669,13 @@ private fun ChatTab(state: MctierUiState, repository: MctierRepository) {
             val quoted = if (r.type == "image") L("[图片]", "[Image]") else if (r.type == "file") r.attachment?.name ?: L("[文件]", "[File]") else (parseChatReply(r.content)?.body ?: r.content).lineSequence().firstOrNull()?.take(40).orEmpty()
             "> [reply:${Uri.encode(r.id)}] @${r.playerName} $quoted\n$text"
         } else text
-        if (!privateMode || privatePeerId != null) repository.sendChat(content, if (privateMode) privatePeerId else null)
+        if (privateMode && privatePeerId == null) return
+        if (!repository.sendChat(content, if (privateMode) privatePeerId else null)) {
+            android.widget.Toast.makeText(context,
+                if (!state.chatReady) L("聊天连接尚未就绪，消息未发送，输入内容已保留", "Chat is not connected. Message not sent; draft preserved")
+                else L("消息发送失败，输入内容已保留", "Message failed; draft preserved"), android.widget.Toast.LENGTH_LONG).show()
+            return
+        }
         input = androidx.compose.ui.text.input.TextFieldValue("")
         replyTo = null
     }
@@ -2659,6 +2701,17 @@ private fun ChatTab(state: MctierUiState, repository: MctierRepository) {
     var hasNew by remember { mutableStateOf(false) }
     var prevCount by remember { mutableStateOf(0) }
     val chatScope = rememberCoroutineScope()
+    var chatViewportHeight by remember { mutableStateOf(0) }
+    val emojiPanelHeight = if (chatViewportHeight > 0) with(LocalDensity.current) { (chatViewportHeight * .42f).toDp() } else 300.dp
+    var messageViewportHeight by remember { mutableStateOf(0) }
+    var followViewportResize by remember { mutableStateOf(true) }
+    LaunchedEffect(isAtBottom, listState.isScrollInProgress) {
+        if (listState.isScrollInProgress) followViewportResize = isAtBottom
+    }
+    // Keep the latest message above the panel/IME as the available height changes.
+    LaunchedEffect(messageViewportHeight) {
+        if (followViewportResize && visibleMessages.isNotEmpty()) listState.scrollToItem(visibleMessages.lastIndex)
+    }
     fun jumpToMessage(target: ChatMessage) {
         val targetIndex = visibleMessages.indexOfFirst { it.id == target.id }
         if (targetIndex < 0) return
@@ -2697,6 +2750,8 @@ private fun ChatTab(state: MctierUiState, repository: MctierRepository) {
         jumpToMessage(visibleMessages[targetIndex])
     }
     LaunchedEffect(privateMode, privatePeerId) {
+        showEmoji = false
+        followViewportResize = true
         replyTo = null
         hasNew = false
         prevCount = visibleMessages.size
@@ -2712,6 +2767,7 @@ private fun ChatTab(state: MctierUiState, repository: MctierRepository) {
             val wasAtBottom = prevCount == 0 || lastVisible >= prevCount - 1
             if (isSelfLatest || wasAtBottom) {
                 runCatching { listState.animateScrollToItem(count - 1) }
+                followViewportResize = true
                 hasNew = false
             } else {
                 hasNew = true
@@ -2720,7 +2776,7 @@ private fun ChatTab(state: MctierUiState, repository: MctierRepository) {
         prevCount = count
     }
     LaunchedEffect(isAtBottom) { if (isAtBottom) hasNew = false }
-    Column(Modifier.fillMaxSize().imePadding()) {
+    Column(Modifier.fillMaxSize().imePadding().onSizeChanged { chatViewportHeight = it.height }) {
         Row(Modifier.fillMaxWidth().padding(8.dp), horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
             val lobbyUnread = state.unreadChatMessages.values.count { it == "lobby" }
             FilterChip(selected = !privateMode, onClick = { privateMode = false }, label = {
@@ -2729,7 +2785,7 @@ private fun ChatTab(state: MctierUiState, repository: MctierRepository) {
                     ChatUnreadBadge(lobbyUnread)
                 }
             })
-            val privateUnread = state.unreadChatMessages.values.count { it.startsWith("private:") }
+            val privateUnread = notificationUnreadCount(state.unreadChatMessages.filterValues { it.startsWith("private:") }, state.peerPreferences, state.players.map { it.id })
             FilterChip(selected = privateMode, onClick = { privateMode = true }, label = {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(L("私聊", "Private"))
@@ -2753,7 +2809,19 @@ private fun ChatTab(state: MctierUiState, repository: MctierRepository) {
                 Modifier.size(40.dp).clip(RoundedCornerShape(10.dp)).background(if (showSearch) GrassGreen else PanelHigh)
                     .clickable { showSearch = !showSearch; if (!showSearch) searchQuery = "" },
                 contentAlignment = Alignment.Center,
-            ) { Icon(Icons.Rounded.Search, L("搜索聊天记录", "Search messages"), tint = TextPrimary) }
+            ) { Icon(Icons.Rounded.Search, L("搜索聊天记录", "Search messages"), tint = if (showSearch) OnAccent else TextPrimary) }
+        }
+        if (!state.chatReady) {
+            Text(
+                when {
+                    state.chatConnectionError?.startsWith("HTTP 525") == true -> L("聊天不可用：信令服务器源站 SSL 握手失败（HTTP 525），正在重试", "Chat unavailable: signaling origin TLS handshake failed (HTTP 525). Retrying")
+                    state.chatConnectionError != null -> L("聊天连接失败（${state.chatConnectionError}），正在重试", "Chat connection failed (${state.chatConnectionError}). Retrying")
+                    else -> L("正在连接聊天服务，尚不能发送消息", "Connecting to chat. Sending is not available yet")
+                },
+                color = if (state.chatConnectionError == null) TextPrimary else DangerRed,
+                fontSize = 12.sp,
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 6.dp),
+            )
         }
         AnimatedVisibility(showSearch && (!privateMode || privatePeerId != null)) {
             Column(Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 4.dp)) {
@@ -2772,7 +2840,7 @@ private fun ChatTab(state: MctierUiState, repository: MctierRepository) {
                                 verticalAlignment = Alignment.CenterVertically,
                             ) {
                                 Column(Modifier.weight(1f)) {
-                                    Text(message.playerName, color = GrassGreen, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                                    Text(message.playerName, color = AccentText, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
                                     Text(if (message.type == "image") L("[图片/表情]", "[Image/emoji]") else if (message.type == "file") message.attachment?.name ?: L("[文件]", "[File]") else visibleChatContent(message.content), color = TextPrimary.copy(alpha = .72f), fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                                 }
                                 Text(formatChatClock(message.timestamp), color = TextPrimary.copy(alpha = .35f), fontSize = 10.sp)
@@ -2783,22 +2851,39 @@ private fun ChatTab(state: MctierUiState, repository: MctierRepository) {
             }
         }
         if (privateMode && privatePeerId == null) {
-            Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Column(Modifier.fillMaxWidth().weight(1f).verticalScroll(rememberScrollState()).padding(horizontal = 12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text(L("选择要私聊的玩家", "Choose a player to message"), color = TextPrimary.copy(alpha = 0.65f), fontSize = 13.sp)
-                state.players.filter { it.id != state.playerId }.forEach { player ->
+                sortPrivatePeers(state.players.filter { it.id != state.playerId }, state.peerPreferences) { it.id }.forEach { player ->
                     val unread = state.unreadChatMessages.values.count { it == "private:${player.id}" }
-                    Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)).background(PanelHigh).clickable {
+                    val preference = state.peerPreferences[player.id] ?: PeerPreference()
+                    var menuOpen by remember(player.id) { mutableStateOf(false) }
+                    val menuContext = LocalContext.current
+                    fun savePreference(value: PeerPreference) {
+                        if (repository.setPeerPreference(player.id, value)) android.widget.Toast.makeText(menuContext, L("私信设置已保存", "Conversation preference saved"), android.widget.Toast.LENGTH_SHORT).show()
+                        menuOpen = false
+                    }
+                    Box {
+                    Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)).background(if (preference.pinned) GrassGreen.copy(alpha = .12f) else PanelHigh).combinedClickable(onLongClick = { menuOpen = true }, onClick = {
                         privatePeerId = player.id
-                    }.padding(horizontal = 9.dp, vertical = 7.dp), verticalAlignment = Alignment.CenterVertically) {
-                        ProfileAvatar(player.name, player.avatarData, 38.dp)
+                    }).padding(horizontal = 9.dp, vertical = 7.dp), verticalAlignment = Alignment.CenterVertically) {
+                        ProfileAvatar(player.name, player.avatarData, 38.dp, onLongClick = { menuOpen = true })
                         Spacer(Modifier.width(10.dp))
                         Text(player.name, color = TextPrimary, modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        ChatUnreadBadge(unread)
+                        if (preference.pinned) Icon(Icons.Rounded.PushPin, L("已置顶", "Pinned"), tint = TextPrimary.copy(alpha = .6f), modifier = Modifier.padding(end = 6.dp).size(15.dp))
+                        if (preference.muted) Icon(Icons.Rounded.NotificationsOff, L("免打扰", "Do Not Disturb"), tint = TextPrimary.copy(alpha = .6f), modifier = Modifier.padding(end = 6.dp).size(15.dp))
+                        if (unread > 0 && !preference.muted) ChatUnreadBadge(unread)
+                        else if (unread > 0 || preference.markedUnread) Box(Modifier.size(8.dp).background(if (preference.muted) TextPrimary.copy(alpha = .45f) else GrassGreen, CircleShape))
+                    }
+                    DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }, containerColor = PanelHigh) {
+                        DropdownMenuItem(text = { Text(if (preference.pinned) L("取消置顶", "Unpin") else L("置顶", "Pin"), color = TextPrimary) }, onClick = { savePreference(preference.copy(pinned = !preference.pinned)) })
+                        DropdownMenuItem(text = { Text(L("标记未读", "Mark unread"), color = TextPrimary) }, onClick = { savePreference(preference.copy(markedUnread = true)) })
+                        DropdownMenuItem(text = { Text(if (preference.muted) L("关闭免打扰", "Disable Do Not Disturb") else L("设置免打扰", "Do Not Disturb"), color = TextPrimary) }, onClick = { savePreference(preference.copy(muted = !preference.muted)) })
+                    }
                     }
                 }
             }
         }
-        Box(Modifier.weight(1f)) {
+        if (!privateMode || privatePeerId != null) Box(Modifier.weight(1f).onSizeChanged { messageViewportHeight = it.height }) {
         LazyColumn(Modifier.fillMaxSize(), state = listState, verticalArrangement = Arrangement.spacedBy(8.dp)) {
             items(visibleMessages, key = { it.id }) {
                 ChatBubble(
@@ -2824,8 +2909,8 @@ private fun ChatTab(state: MctierUiState, repository: MctierRepository) {
                 contentAlignment = Alignment.Center,
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Rounded.ArrowDownward, null, tint = TextPrimary, modifier = Modifier.size(16.dp))
-                    if (hasNew) { Spacer(Modifier.width(4.dp)); Text(L("新消息", "New messages"), fontSize = 12.sp, color = TextPrimary) }
+                    Icon(Icons.Rounded.ArrowDownward, null, tint = if (hasNew) OnAccent else TextPrimary, modifier = Modifier.size(16.dp))
+                    if (hasNew) { Spacer(Modifier.width(4.dp)); Text(L("新消息", "New messages"), fontSize = 12.sp, color = OnAccent) }
                 }
             }
         }
@@ -2842,7 +2927,7 @@ private fun ChatTab(state: MctierUiState, repository: MctierRepository) {
                     Box(
                         Modifier.clip(RoundedCornerShape(16.dp)).background(GrassGreen.copy(alpha = 0.2f))
                             .clickable { applyMention(name) }.padding(horizontal = 12.dp, vertical = 6.dp),
-                    ) { Text("@$name", color = GrassGreen, fontSize = 13.sp) }
+                    ) { Text("@$name", color = AccentText, fontSize = 13.sp) }
                 }
             }
         }
@@ -2856,7 +2941,7 @@ private fun ChatTab(state: MctierUiState, repository: MctierRepository) {
                     Box(Modifier.width(3.dp).height(32.dp).clip(RoundedCornerShape(2.dp)).background(GrassGreen))
                     Spacer(Modifier.width(8.dp))
                     Column(Modifier.weight(1f)) {
-                        Text(L("回复 ${r.playerName}", "Reply to ${r.playerName}"), fontSize = 11.sp, color = GrassGreen)
+                        Text(L("回复 ${r.playerName}", "Reply to ${r.playerName}"), fontSize = 11.sp, color = AccentText)
                         Text(if (r.type == "image") L("[图片]", "[Image]") else r.content, fontSize = 12.sp, color = TextPrimary.copy(alpha = 0.7f), maxLines = 1, overflow = TextOverflow.Ellipsis)
                     }
                     Icon(Icons.Rounded.Close, L("取消引用", "Cancel quote"), tint = TextPrimary.copy(alpha = 0.6f), modifier = Modifier.size(18.dp).clickable { replyTo = null })
@@ -2868,7 +2953,7 @@ private fun ChatTab(state: MctierUiState, repository: MctierRepository) {
             val visibleEmoji = if (emojiCat == "recent") state.recentEmojiIds.mapNotNull { id -> state.customEmojiItems.firstOrNull { it.id == id } }
                 else state.customEmojiItems.filter { it.categoryId == emojiCat }
             val manageableCategory = state.emojiCategories.firstOrNull { it.id == emojiCat && !it.builtin }
-            Column(Modifier.fillMaxWidth().padding(bottom = 8.dp)) {
+            Column(Modifier.fillMaxWidth().heightIn(max = emojiPanelHeight).padding(bottom = 8.dp)) {
                 Row(
                     Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(bottom = 8.dp),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -2880,7 +2965,7 @@ private fun ChatTab(state: MctierUiState, repository: MctierRepository) {
                                 .background(if (active) GrassGreen else PanelHigh)
                                 .clickable { emojiCat = category.id }
                                 .padding(horizontal = 14.dp, vertical = 6.dp),
-                        ) { Text(category.name, color = TextPrimary, fontSize = 13.sp, fontWeight = if (active) FontWeight.Bold else FontWeight.Normal) }
+                        ) { Text(category.name, color = if (active) OnAccent else TextPrimary, fontSize = 13.sp, fontWeight = if (active) FontWeight.Bold else FontWeight.Normal) }
                     }
                     Box(Modifier.size(32.dp).clip(CircleShape).background(PanelHigh).clickable { showNewEmojiCategory = true }, contentAlignment = Alignment.Center) { Icon(Icons.Rounded.Add, L("新建分类", "New category"), tint = TextPrimary, modifier = Modifier.size(18.dp)) }
                     if (manageableCategory != null) {
@@ -2891,11 +2976,11 @@ private fun ChatTab(state: MctierUiState, repository: MctierRepository) {
                     }
                 }
                 if (visibleEmoji.isEmpty()) {
-                    Column(Modifier.fillMaxWidth().height(120.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
+                    Column(Modifier.fillMaxWidth().weight(1f, fill = false).heightIn(max = 150.dp).verticalScroll(rememberScrollState()), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
                         if (emojiCat == "builtin" && state.emojiBuiltinSyncing) {
                             CircularProgressIndicator(
                                 modifier = Modifier.size(26.dp),
-                                color = GrassGreen,
+                                color = AccentText,
                                 strokeWidth = 2.5.dp,
                             )
                         } else {
@@ -2907,7 +2992,7 @@ private fun ChatTab(state: MctierUiState, repository: MctierRepository) {
                             LinearProgressIndicator(
                                 progress = { fraction.coerceIn(0f, 1f) },
                                 modifier = Modifier.width(240.dp).height(7.dp).clip(RoundedCornerShape(4.dp)),
-                                color = GrassGreen,
+                                color = AccentText,
                                 trackColor = PanelHigh,
                             )
                             Spacer(Modifier.height(6.dp))
@@ -2919,6 +3004,7 @@ private fun ChatTab(state: MctierUiState, repository: MctierRepository) {
                         }
                         Text(
                             when {
+                                emojiCat == "builtin" && state.emojiBuiltinError != null && state.emojiBuiltinSyncing -> L("下载暂时中断，正在自动重试", "Download interrupted. Retrying automatically")
                                 emojiCat == "builtin" && state.emojiBuiltinSyncing -> L("正在准备内置表情...", "Preparing built-in emoji...")
                                 emojiCat == "builtin" && state.emojiBuiltinError != null -> L("内置表情下载失败", "Built-in emoji download failed")
                                 emojiCat == "builtin" -> L("内置表情资源尚未安装", "Built-in emoji are not installed")
@@ -2928,16 +3014,28 @@ private fun ChatTab(state: MctierUiState, repository: MctierRepository) {
                             fontSize = 12.sp,
                         )
                         if (emojiCat == "builtin" && state.emojiBuiltinError != null && !state.emojiBuiltinSyncing) {
+                            Text(state.emojiBuiltinError, color = TextPrimary.copy(alpha = .65f), fontSize = 11.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
                             TextButton(onClick = repository::retryBuiltinEmojiSync) {
-                                Icon(Icons.Rounded.Refresh, null, tint = GrassGreen, modifier = Modifier.size(17.dp))
+                                Icon(Icons.Rounded.Refresh, null, tint = AccentText, modifier = Modifier.size(17.dp))
                                 Spacer(Modifier.width(5.dp))
-                                Text(L("重试", "Retry"), color = GrassGreen)
+                                Text(L("重试", "Retry"), color = AccentText)
                             }
                         }
                     }
                 } else {
+                    if (emojiCat == "builtin" && (state.emojiBuiltinSyncing || state.emojiBuiltinError != null)) {
+                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                if (state.emojiBuiltinSyncing && state.emojiBuiltinError != null) L("正在自动重试，已缓存 ${state.emojiBuiltinDownloaded}/${state.emojiBuiltinTotal}", "Retrying automatically, ${state.emojiBuiltinDownloaded}/${state.emojiBuiltinTotal} cached")
+                                else if (state.emojiBuiltinSyncing) L("正在补全表情 ${state.emojiBuiltinDownloaded}/${state.emojiBuiltinTotal}", "Downloading ${state.emojiBuiltinDownloaded}/${state.emojiBuiltinTotal}")
+                                else state.emojiBuiltinError.orEmpty(),
+                                modifier = Modifier.weight(1f), color = TextPrimary.copy(alpha = .65f), fontSize = 11.sp, maxLines = 2, overflow = TextOverflow.Ellipsis,
+                            )
+                            if (!state.emojiBuiltinSyncing) TextButton(onClick = repository::retryBuiltinEmojiSync) { Text(L("继续下载", "Resume"), color = AccentText) }
+                        }
+                    }
                     FlowRow(
-                        Modifier.fillMaxWidth().heightIn(max = 210.dp).verticalScroll(rememberScrollState()),
+                        Modifier.fillMaxWidth().weight(1f, fill = false).heightIn(max = 210.dp).verticalScroll(rememberScrollState()),
                         horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp),
                     ) {
                         visibleEmoji.forEach { emoji ->
@@ -2947,8 +3045,7 @@ private fun ChatTab(state: MctierUiState, repository: MctierRepository) {
                                     .combinedClickable(
                                         onClick = {
                                             repository.sendEmoji(emoji, if (privateMode) privatePeerId else null) { ok ->
-                                                if (ok) showEmoji = false
-                                                else android.widget.Toast.makeText(context, L("表情发送失败", "Failed to send emoji"), android.widget.Toast.LENGTH_SHORT).show()
+                                                if (!ok) android.widget.Toast.makeText(context, L("表情发送失败", "Failed to send emoji"), android.widget.Toast.LENGTH_SHORT).show()
                                             }
                                         },
                                         onLongClick = if (manageable) ({
@@ -3005,7 +3102,7 @@ private fun ChatTab(state: MctierUiState, repository: MctierRepository) {
                     showManageEmojiCategory = false
                     android.widget.Toast.makeText(context, L("分类已重命名", "Category renamed"), android.widget.Toast.LENGTH_SHORT).show()
                 } else android.widget.Toast.makeText(context, L("分类名称不能为空或与现有分类重复", "Category name cannot be empty or duplicate"), android.widget.Toast.LENGTH_SHORT).show()
-            }) { Text(L("保存", "Save"), color = GrassGreen) } },
+            }) { Text(L("保存", "Save"), color = AccentText) } },
             dismissButton = {
                 Row {
                     TextButton(onClick = {
@@ -3049,7 +3146,7 @@ private fun ChatTab(state: MctierUiState, repository: MctierRepository) {
                                     Modifier.clip(RoundedCornerShape(8.dp)).background(if (selected) GrassGreen else PanelHigh)
                                         .clickable { managedEmojiCategory = category.id }
                                         .padding(horizontal = 11.dp, vertical = 7.dp),
-                                ) { Text(category.name, color = TextPrimary, fontSize = 12.sp, fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal) }
+                                ) { Text(category.name, color = if (selected) OnAccent else TextPrimary, fontSize = 12.sp, fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal) }
                             }
                         }
                     }
@@ -3064,7 +3161,7 @@ private fun ChatTab(state: MctierUiState, repository: MctierRepository) {
                                 android.widget.Toast.makeText(context, L("表情信息已保存", "Emoji changes saved"), android.widget.Toast.LENGTH_SHORT).show()
                             } else android.widget.Toast.makeText(context, L("保存失败，请检查名称和目标分类", "Save failed. Check the name and destination category"), android.widget.Toast.LENGTH_SHORT).show()
                         },
-                    ) { Text(L("保存", "Save"), color = GrassGreen) }
+                    ) { Text(L("保存", "Save"), color = AccentText) }
                 },
                 dismissButton = {
                     Row {
@@ -3087,31 +3184,35 @@ private fun ChatTab(state: MctierUiState, repository: MctierRepository) {
         }
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Box(
-                Modifier.size(46.dp).clip(CircleShape).background(if (showEmoji) GrassGreen else PanelHigh).clickable { showEmoji = !showEmoji },
+                Modifier.size(46.dp).clip(CircleShape).background(if (showEmoji) GrassGreen else PanelHigh).clickable {
+                    chatFocusManager.clearFocus()
+                    keyboardController?.hide()
+                    showEmoji = !showEmoji
+                },
                 contentAlignment = Alignment.Center,
-            ) { Icon(Icons.Rounded.EmojiEmotions, L("表情", "Emoji"), tint = TextPrimary) }
+            ) { Icon(Icons.Rounded.EmojiEmotions, L("表情", "Emoji"), tint = if (showEmoji) OnAccent else TextPrimary, modifier = Modifier.size(24.dp)) }
             Box(
-                Modifier.size(46.dp).clip(CircleShape).background(PanelHigh).clickable { filePicker.launch(arrayOf("*/*")) },
+                Modifier.size(46.dp).clip(CircleShape).background(PanelHigh).clickable { showEmoji = false; filePicker.launch(arrayOf("*/*")) },
                 contentAlignment = Alignment.Center,
-            ) { Icon(Icons.Rounded.AttachFile, L("发送文件", "Send file"), tint = TextPrimary) }
+            ) { Icon(Icons.Rounded.AttachFile, L("发送文件", "Send file"), tint = TextPrimary, modifier = Modifier.size(24.dp)) }
             Column(Modifier.weight(1f)) {
-                if (recordingVoice) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        androidx.compose.material3.CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
-                        Text(
-                            if (cancelVoice) L("松开取消 ${voiceSeconds}s", "Release to cancel ${voiceSeconds}s")
-                            else L("录音中，上滑取消 ${voiceSeconds}s", "Recording, slide up to cancel ${voiceSeconds}s"),
-                            modifier = Modifier.weight(1f),
-                            color = TextPrimary,
-                        )
-                    }
-                }
                 Box(Modifier.fillMaxWidth()) {
                     OutlinedTextField(
                         value = input, onValueChange = { input = it },
-                        modifier = Modifier.fillMaxWidth().focusRequester(voiceInputFocus),
+                        modifier = Modifier.fillMaxWidth().focusRequester(voiceInputFocus).onFocusChanged { if (it.isFocused) showEmoji = false },
                         placeholder = { Text(L("长按发送语音", "Hold to record voice"), color = TextPrimary.copy(alpha = 0.55f)) }, maxLines = 4, shape = RoundedCornerShape(14.dp), colors = fieldColors(),
                     )
+                    // Keep the input and gesture surface at the same position
+                    // throughout the press; changing their slot/layout cancels it.
+                    Box(Modifier.matchParentSize()) {
+                        if (recordingVoice) Column(
+                            Modifier.fillMaxSize().clip(RoundedCornerShape(14.dp)).background(PanelHigh).padding(horizontal = 8.dp),
+                            verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally,
+                        ) {
+                            Text("${voiceSeconds}s", color = if (cancelVoice) DangerRed else GrassGreen, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                            Text(if (cancelVoice) L("松开取消", "Release to cancel") else L("上滑取消", "Slide up to cancel"), color = TextPrimary, fontSize = 11.sp, maxLines = 1)
+                        }
+                    }
                     if (input.text.isEmpty()) {
                         // Consume the empty-field gesture before BasicTextField sees
                         // it. A tap explicitly opens the IME; a hold records and
@@ -3121,26 +3222,30 @@ private fun ChatTab(state: MctierUiState, repository: MctierRepository) {
                                 when (event.actionMasked) {
                                     android.view.MotionEvent.ACTION_DOWN -> {
                                         voiceHoldJob?.cancel()
-                                        voiceDrag = event.y
+                                        voiceDrag = event.rawY
                                         voiceLongPressTriggered = false
                                         voiceHoldJob = voiceGestureScope.launch {
                                             kotlinx.coroutines.delay(android.view.ViewConfiguration.getLongPressTimeout().toLong())
                                             voiceLongPressTriggered = true
-                                            if (androidx.core.content.ContextCompat.checkSelfPermission(context, android.Manifest.permission.RECORD_AUDIO) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                                            if (!state.chatReady) {
+                                                android.widget.Toast.makeText(context, L("聊天连接尚未就绪，暂不能发送语音", "Chat is not connected. Voice messages are unavailable"), android.widget.Toast.LENGTH_LONG).show()
+                                            } else if (androidx.core.content.ContextCompat.checkSelfPermission(context, android.Manifest.permission.RECORD_AUDIO) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
                                                 microphonePermission.launch(android.Manifest.permission.RECORD_AUDIO)
                                             } else runCatching {
+                                                releaseLobbyVoice = repository.suspendLobbyVoiceForRecording()
                                                 voiceRecorder.start()
                                                 cancelVoice = false
                                                 voiceSeconds = 0
                                                 recordingVoice = true
                                             }.onFailure {
+                                                finishVoice(true)
                                                 android.widget.Toast.makeText(context, L("无法开始录音", "Cannot start recording"), android.widget.Toast.LENGTH_SHORT).show()
                                             }
                                         }
                                         true
                                     }
                                     android.view.MotionEvent.ACTION_MOVE -> {
-                                        if (recordingVoice) cancelVoice = voiceDrag - event.y > cancelVoiceThresholdPx
+                                        if (recordingVoice) cancelVoice = voiceDrag - event.rawY > cancelVoiceThresholdPx
                                         true
                                     }
                                     android.view.MotionEvent.ACTION_UP -> {
@@ -3149,7 +3254,11 @@ private fun ChatTab(state: MctierUiState, repository: MctierRepository) {
                                         if (recordingVoice) finishVoice(cancelVoice)
                                         else if (!voiceLongPressTriggered) {
                                             voiceInputFocus.requestFocus()
-                                            keyboardController?.show()
+                                            voiceGestureScope.launch {
+                                                // The text input session is installed after focus recomposes.
+                                                androidx.compose.runtime.withFrameNanos { }
+                                                if (!recordingVoice) keyboardController?.show()
+                                            }
                                         }
                                         voiceLongPressTriggered = false
                                         true
@@ -3169,10 +3278,10 @@ private fun ChatTab(state: MctierUiState, repository: MctierRepository) {
                 }
             }
             Box(
-                Modifier.size(46.dp).clip(CircleShape).background(if (input.text.isBlank()) PanelHigh else GrassGreen)
+                Modifier.size(46.dp).clip(CircleShape).background(if (input.text.isBlank()) PanelHigh else ChatSendFill)
                     .clickable(enabled = input.text.isNotBlank()) { doSend() },
                 contentAlignment = Alignment.Center,
-            ) { Icon(Icons.AutoMirrored.Rounded.Send, L("发送", "Send"), tint = if (input.text.isBlank()) TextPrimary.copy(alpha = 0.4f) else TextPrimary) }
+            ) { Icon(Icons.AutoMirrored.Rounded.Send, L("发送", "Send"), tint = if (input.text.isBlank()) TextPrimary.copy(alpha = 0.4f) else Color.White) }
         }
         Spacer(Modifier.height(6.dp))
         }
@@ -3191,7 +3300,7 @@ private fun buildMentionText(content: String, baseColor: Color): AnnotatedString
         val trimmed = raw.trimEnd('。', '，', '、', '.', ',', '!', '?', '！', '？', ';', '；', ')', '）', ']', '】')
         if (isSafeChatUrl(trimmed)) {
             pushStringAnnotation("url", trimmed)
-            withStyle(SpanStyle(color = if (baseColor.luminance() > 0.6f) Color(0xFF075E9B) else Color(0xFF69B1FF), textDecoration = androidx.compose.ui.text.style.TextDecoration.Underline)) { append(trimmed) }
+            withStyle(SpanStyle(color = baseColor, fontWeight = FontWeight.SemiBold, textDecoration = androidx.compose.ui.text.style.TextDecoration.Underline)) { append(trimmed) }
             pop()
             append(raw.substring(trimmed.length))
         } else {
@@ -3241,6 +3350,7 @@ private fun ChatMessageText(content: String, color: Color, modifier: Modifier = 
 private fun formatChatClock(timestamp: Long): String =
     if (timestamp > 0) java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault()).format(java.util.Date(timestamp)) else "--:--"
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun ProfileAvatar(
     name: String,
@@ -3248,6 +3358,7 @@ private fun ProfileAvatar(
     size: androidx.compose.ui.unit.Dp,
     editable: Boolean = false,
     speaking: Boolean = false,
+    onLongClick: (() -> Unit)? = null,
     onClick: () -> Unit = {},
 ) {
     val bitmap = remember(avatarData) {
@@ -3258,20 +3369,23 @@ private fun ProfileAvatar(
             }.getOrNull()
         }
     }
+    var showAvatar by remember(avatarData) { mutableStateOf(false) }
     Box(
         Modifier.size(size)
             .clip(CircleShape)
             .background(if (speaking) GrassGreen else PanelHigh)
             .then(if (speaking) Modifier.border(2.dp, GrassGreen, CircleShape) else Modifier)
-            .clickable(enabled = editable, onClick = onClick),
+            .combinedClickable(enabled = editable || bitmap != null || onLongClick != null, onLongClick = onLongClick,
+                onClick = { if (editable) onClick() else if (bitmap != null) showAvatar = true }),
         contentAlignment = Alignment.Center,
     ) {
         if (bitmap != null) {
-            Image(bitmap = bitmap.asImageBitmap(), contentDescription = L("头像", "Avatar"), contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
+            Image(bitmap = bitmap.asImageBitmap(), contentDescription = L("$name 的头像", "$name's avatar"), contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
         } else {
             Text(name.trim().firstOrNull()?.uppercase() ?: "?", fontWeight = FontWeight.Bold, color = TextPrimary)
         }
     }
+    if (showAvatar && bitmap != null && !editable) FullscreenImageViewer(bitmap, L("$name 的头像", "$name's avatar"), { showAvatar = false })
 }
 
 /** 聊天消息首字符圆形头像（与玩家列表统一风格） */
@@ -3346,11 +3460,11 @@ private fun LocalAudioFilePlayer(file: java.io.File, meta: ChatAttachmentMeta, m
             runCatching {
                 if (player?.isPlaying == true) { player.pause(); playing = false } else { player?.start(); playing = player != null }
             }.onFailure { playing = false }
-        }, contentAlignment = Alignment.Center) { Icon(if (player == null) Icons.Rounded.Close else if (playing) Icons.Rounded.Pause else Icons.Rounded.PlayArrow, null, tint = if (mine) Color.White else TextPrimary, modifier = Modifier.size(18.dp)) }
+        }, contentAlignment = Alignment.Center) { Icon(if (player == null) Icons.Rounded.Close else if (playing) Icons.Rounded.Pause else Icons.Rounded.PlayArrow, null, tint = if (mine) OnAccent else TextPrimary, modifier = Modifier.size(18.dp)) }
         Column(Modifier.weight(1f)) {
-            Text(meta.name, maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, color = if (mine) Color.White else TextPrimary)
-            Slider(value = position.toFloat(), onValueChange = { value -> position = value.toInt(); runCatching { player?.seekTo(position) } }, valueRange = 0f..duration.coerceAtLeast(1).toFloat(), enabled = player != null, modifier = Modifier.fillMaxWidth().height(22.dp), colors = SliderDefaults.colors(thumbColor = if (mine) Color.White else GrassGreen, activeTrackColor = if (mine) Color.White else GrassGreen, inactiveTrackColor = TextPrimary.copy(alpha = .2f)))
-            Text(if (player == null) L("无法解码此音频 · ${humanFileSize(meta.size)}", "Unsupported audio · ${humanFileSize(meta.size)}") else "${mediaClock(position)} / ${mediaClock(duration)} · ${humanFileSize(meta.size)}", fontSize = 10.sp, color = (if (mine) Color.White else TextPrimary).copy(alpha = .68f))
+            Text(meta.name, maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, color = if (mine) OnAccent else TextPrimary)
+            Slider(value = position.toFloat(), onValueChange = { value -> position = value.toInt(); runCatching { player?.seekTo(position) } }, valueRange = 0f..duration.coerceAtLeast(1).toFloat(), enabled = player != null, modifier = Modifier.fillMaxWidth().height(22.dp), colors = SliderDefaults.colors(thumbColor = if (mine) OnAccent else GrassGreen, activeTrackColor = if (mine) OnAccent else GrassGreen, inactiveTrackColor = TextPrimary.copy(alpha = .2f)))
+            Text(if (player == null) L("无法解码此音频 · ${humanFileSize(meta.size)}", "Unsupported audio · ${humanFileSize(meta.size)}") else "${mediaClock(position)} / ${mediaClock(duration)} · ${humanFileSize(meta.size)}", fontSize = 10.sp, color = (if (mine) OnAccent else TextPrimary).copy(alpha = .68f))
         }
     }
 }
@@ -3524,9 +3638,10 @@ private fun OfficeDocumentPreview(kind: String, sections: List<String>) {
             }
         }
         "sheet" -> Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(14.dp)) {
-            sections.forEachIndexed { index, section ->
+            nonEmptySheets(sections).forEachIndexed { index, section ->
+                val sheetNumber = Regex("^--- (\\d+) ---").find(section)?.groupValues?.get(1) ?: "${index + 1}"
                 Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)).border(1.dp, TextPrimary.copy(alpha = .14f), RoundedCornerShape(8.dp))) {
-                    Text(L("工作表 ${index + 1}", "Sheet ${index + 1}"), Modifier.fillMaxWidth().background(GrassGreen.copy(alpha = .15f)).padding(10.dp), color = GrassGreen, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                    Text(L("工作表 $sheetNumber", "Sheet $sheetNumber"), Modifier.fillMaxWidth().background(GrassGreen.copy(alpha = .15f)).padding(10.dp), color = AccentText, fontWeight = FontWeight.Bold, fontSize = 12.sp)
                     Column(Modifier.horizontalScroll(rememberScrollState()).background(Color.White)) {
                         section.lines().filter { it.isNotBlank() && !it.trim().matches(Regex("--- \\d+ ---")) }.take(500).forEachIndexed { rowIndex, row ->
                             Row(Modifier.background(if (rowIndex == 0) Color(0xFFEDF5E9) else Color.White)) {
@@ -3554,7 +3669,7 @@ private fun FilePreviewDialog(file: java.io.File, meta: ChatAttachmentMeta, onDo
         value = withContext(Dispatchers.IO) { runCatching {
             when (kind) {
                 "text" -> listOf(file.bufferedReader().use { it.readText().take(2 * 1024 * 1024) })
-                "word", "slides", "sheet" -> extractOfficeText(file, kind)
+                "word", "sheet" -> extractOfficeText(file, kind)
                 else -> emptyList()
             }
         }.getOrDefault(emptyList()) }
@@ -3581,8 +3696,11 @@ private fun FilePreviewDialog(file: java.io.File, meta: ChatAttachmentMeta, onDo
                     }
                     "image" -> AsyncImage(model = file, contentDescription = meta.name, contentScale = ContentScale.Fit, modifier = Modifier.fillMaxSize())
                     "pdf" -> PdfFileViewer(file)
-                    "text", "word", "slides", "sheet" -> when {
-                        textSections == null -> CircularProgressIndicator(color = GrassGreen)
+                    "archive" -> LocalFilePreview(file, kind)
+                    "slides" -> if (file.extension.equals("pptx", ignoreCase = true)) LocalFilePreview(file, kind)
+                        else Text(L("此旧版演示文稿需要先另存为 PPTX 或 PDF 才能显示实际页面", "Save this legacy presentation as PPTX or PDF to view its pages"), color = TextPrimary, textAlign = TextAlign.Center)
+                    "text", "word", "sheet" -> when {
+                        textSections == null -> CircularProgressIndicator(color = AccentText)
                         textSections.isNullOrEmpty() -> Text(L("无法解析此文件的可预览内容", "No previewable content could be parsed from this file"), color = TextPrimary.copy(alpha = .68f), textAlign = TextAlign.Center)
                         else -> OfficeDocumentPreview(kind, textSections.orEmpty())
                     }
@@ -3604,17 +3722,26 @@ private fun ChatImageBubble(
 ) {
     val imageLoader = rememberAnimatedImageLoader()
     var showZoom by remember(model) { mutableStateOf(false) }
+    var imageAspect by remember(model) { mutableStateOf(1f) }
     AsyncImage(
         model = model,
         imageLoader = imageLoader,
         contentDescription = description,
         contentScale = ContentScale.Fit,
-        modifier = Modifier.clip(RoundedCornerShape(14.dp)).widthIn(max = 260.dp).heightIn(max = 240.dp)
+        onSuccess = { result ->
+            val image = result.result.image
+            if (image.width > 0 && image.height > 0) imageAspect = image.width.toFloat() / image.height
+        },
+        modifier = Modifier.width(minOf(180f, 180f * imageAspect).dp).aspectRatio(imageAspect).clip(RoundedCornerShape(8.dp))
             .graphicsLayer { this.alpha = alpha }
             .combinedClickable(onClick = { showZoom = true }, onLongClick = onLongClick),
     )
-    if (showZoom) {
-        Dialog(onDismissRequest = { showZoom = false }, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+    if (showZoom) FullscreenImageViewer(model, description, { showZoom = false }, onDownload)
+}
+
+@Composable
+private fun FullscreenImageViewer(model: Any, description: String, onClose: () -> Unit, onDownload: (() -> Unit)? = null) {
+        Dialog(onDismissRequest = onClose, properties = DialogProperties(usePlatformDefaultWidth = false)) {
             var scale by remember { mutableStateOf(1f) }
             var offsetX by remember { mutableStateOf(0f) }
             var offsetY by remember { mutableStateOf(0f) }
@@ -3624,12 +3751,12 @@ private fun ChatImageBubble(
                 offsetY += panChange.y
             }
             Box(
-                Modifier.fillMaxSize().background(Color.Black.copy(alpha = .95f)).clickable { showZoom = false },
+                Modifier.fillMaxSize().background(Color.Black.copy(alpha = .95f)).clickable(onClick = onClose),
                 contentAlignment = Alignment.Center,
             ) {
                 AsyncImage(
                     model = model,
-                    imageLoader = imageLoader,
+                    imageLoader = rememberAnimatedImageLoader(),
                     contentDescription = description,
                     contentScale = ContentScale.Fit,
                     modifier = Modifier.fillMaxSize().graphicsLayer(
@@ -3639,11 +3766,10 @@ private fun ChatImageBubble(
                         translationY = offsetY,
                     ).transformable(transformState),
                 )
-                CircleIconButton(Icons.Rounded.Close, L("关闭", "Close"), Modifier.align(Alignment.TopEnd).padding(16.dp)) { showZoom = false }
+                CircleIconButton(Icons.Rounded.Close, L("关闭", "Close"), Modifier.align(Alignment.TopEnd).padding(16.dp), onClick = onClose)
                 if (onDownload != null) CircleIconButton(Icons.Rounded.Download, L("下载", "Download"), Modifier.align(Alignment.TopStart).padding(16.dp)) { onDownload() }
             }
         }
-    }
 }
 
 @Composable
@@ -3665,7 +3791,7 @@ private fun PdfFileViewer(file: java.io.File) {
         }.getOrDefault(emptyList()) }
         finished = true
     }
-    if (!finished) CircularProgressIndicator(color = GrassGreen)
+    if (!finished) CircularProgressIndicator(color = AccentText)
     else if (pages.isEmpty()) Text(L("无法解析此 PDF 文件", "Unable to parse this PDF"), color = TextPrimary.copy(alpha = .68f))
     else LazyColumn(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(10.dp)) { items(pages) { bitmap -> Image(bitmap.asImageBitmap(), null, Modifier.fillMaxWidth().background(Color.White), contentScale = ContentScale.FillWidth) } }
 }
@@ -3724,7 +3850,7 @@ private fun FileAttachmentBubble(message: ChatMessage, repository: MctierReposit
                 kind == "image" && localFile != null -> AsyncImage(model = localFile, contentDescription = meta.name, contentScale = ContentScale.Fit, modifier = Modifier.fillMaxSize())
                 kind == "video" && videoThumbnail != null -> Image(videoThumbnail!!.asImageBitmap(), meta.name, contentScale = ContentScale.Fit, modifier = Modifier.fillMaxSize())
                 else -> Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(7.dp)) {
-                    if (loading) CircularProgressIndicator(Modifier.size(23.dp), strokeWidth = 2.dp, color = GrassGreen)
+                    if (loading) CircularProgressIndicator(Modifier.size(23.dp), strokeWidth = 2.dp, color = AccentText)
                     else Icon(if (kind == "video") Icons.Rounded.PlayArrow else Icons.Rounded.Description, null, tint = Color.White.copy(alpha = .72f))
                     Text(if (loading) L("正在加载预览", "Loading preview") else meta.name, maxLines = 1, overflow = TextOverflow.Ellipsis, color = Color.White.copy(alpha = .72f), fontSize = 11.sp)
                 }
@@ -3745,8 +3871,8 @@ private fun FileAttachmentBubble(message: ChatMessage, repository: MctierReposit
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(10.dp),
     ) {
-        Box(Modifier.size(36.dp).clip(RoundedCornerShape(8.dp)).background(TextPrimary.copy(alpha = .12f)), contentAlignment = Alignment.Center) { if (loading) CircularProgressIndicator(Modifier.size(19.dp), strokeWidth = 2.dp, color = TextPrimary) else Icon(Icons.Rounded.Description, null, tint = if (message.mine) Color.White else GrassGreen) }
-        Column(Modifier.weight(1f)) { Text(meta.name, maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.SemiBold, color = if (message.mine) Color.White else TextPrimary, fontSize = 13.sp); Text("${meta.mime} · ${humanFileSize(meta.size)}", maxLines = 1, overflow = TextOverflow.Ellipsis, color = (if (message.mine) Color.White else TextPrimary).copy(alpha = .65f), fontSize = 10.sp) }
+        Box(Modifier.size(36.dp).clip(RoundedCornerShape(8.dp)).background(TextPrimary.copy(alpha = .12f)), contentAlignment = Alignment.Center) { if (loading) CircularProgressIndicator(Modifier.size(19.dp), strokeWidth = 2.dp, color = TextPrimary) else Icon(Icons.Rounded.Description, null, tint = if (message.mine) OnAccent else GrassGreen) }
+        Column(Modifier.weight(1f)) { Text(meta.name, maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.SemiBold, color = if (message.mine) OnAccent else TextPrimary, fontSize = 13.sp); Text("${meta.mime} · ${humanFileSize(meta.size)}", maxLines = 1, overflow = TextOverflow.Ellipsis, color = (if (message.mine) OnAccent else TextPrimary).copy(alpha = .65f), fontSize = 10.sp) }
     }
     if (showPreview && localFile != null) FilePreviewDialog(
         localFile!!,
@@ -3776,6 +3902,7 @@ private fun ChatBubble(
     val context = LocalContext.current
     var showActions by remember(message.id) { mutableStateOf(false) }
     var transcribingVoice by remember(message.id) { mutableStateOf(false) }
+    var transcriptionStatus by remember(message.id) { mutableStateOf("") }
     var voiceTranscript by remember(message.id) { mutableStateOf<String?>(null) }
     var voiceTranscriptError by remember(message.id) { mutableStateOf<String?>(null) }
     var recallClock by remember(message.id) { mutableStateOf(System.currentTimeMillis()) }
@@ -3828,7 +3955,8 @@ private fun ChatBubble(
             horizontalArrangement = if (message.mine) Arrangement.End else Arrangement.Start,
             modifier = Modifier.fillMaxWidth(),
         ) {
-            if (!message.mine) { ChatAvatar(message, avatarData); Spacer(Modifier.width(6.dp)); BubbleTail(mine = false) }
+            val visualMessage = !message.recalled && (message.type == "image" || (message.type == "file" && message.attachment?.let { chatAttachmentKind(it) in setOf("image", "video") } == true))
+            if (!message.mine) { ChatAvatar(message, avatarData); Spacer(Modifier.width(6.dp)); if (!visualMessage) BubbleTail(mine = false) }
             Box(
                 modifier = Modifier
                     .weight(1f, fill = false),
@@ -3852,15 +3980,16 @@ private fun ChatBubble(
                         horizontalAlignment = if (message.mine) Alignment.End else Alignment.Start,
                         verticalArrangement = Arrangement.spacedBy(6.dp),
                     ) {
-                        VoiceMessagePlayer(message.imageBase64, message.mine)
+                        val voiceDuration = remember(message.id) { runCatching { org.json.JSONObject(message.content).optDouble("duration", 0.0).toFloat() }.getOrDefault(0f) }
+                        VoiceMessagePlayer(message.imageBase64, message.mine, voiceDuration, ::openActions)
                         when {
                             transcribingVoice -> Row(
                                 Modifier.clip(RoundedCornerShape(10.dp)).background(PanelHigh).padding(horizontal = 11.dp, vertical = 9.dp),
                                 verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                             ) {
-                                CircularProgressIndicator(Modifier.size(15.dp), strokeWidth = 2.dp, color = GrassGreen)
-                                Text(L("正在识别语音…", "Transcribing voice…"), color = TextPrimary.copy(alpha = .72f), fontSize = 12.sp)
+                                CircularProgressIndicator(Modifier.size(15.dp), strokeWidth = 2.dp, color = AccentText)
+                                Text(transcriptionStatus.ifBlank { L("正在识别语音…", "Transcribing voice…") }, color = TextPrimary.copy(alpha = .72f), fontSize = 12.sp)
                             }
                             voiceTranscriptError != null -> Text(
                                 voiceTranscriptError.orEmpty(),
@@ -3915,22 +4044,22 @@ private fun ChatBubble(
                                     verticalAlignment = Alignment.CenterVertically,
                                     modifier = Modifier.clip(RoundedCornerShape(6.dp)).clickable { onJumpToQuote(message) }.padding(bottom = 6.dp),
                                 ) {
-                                    Box(Modifier.width(3.dp).height(16.dp).clip(RoundedCornerShape(2.dp)).background(if (message.mine) Color(0xFF06210A) else GrassGreen))
+                                    Box(Modifier.width(3.dp).height(16.dp).clip(RoundedCornerShape(2.dp)).background(if (message.mine) OnAccent else GrassGreen))
                                     Spacer(Modifier.width(6.dp))
                                     Text(parsedReply.quoteLine, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis,
-                                        color = if (message.mine) Color(0xFF06210A).copy(alpha = 0.7f) else TextPrimary.copy(alpha = 0.6f))
+                                        color = if (message.mine) OnAccent.copy(alpha = 0.7f) else TextPrimary.copy(alpha = 0.6f))
                                 }
                             }
                             ChatMessageText(
                                 bodyText,
-                                if (message.mine) Color(0xFF06210A) else TextPrimary.copy(alpha = 0.92f),
+                                if (message.mine) OnAccent else TextPrimary.copy(alpha = 0.92f),
                                 Modifier.graphicsLayer { alpha = highlightAlpha.value },
                             )
                         }
                     }
                 }
             }
-            if (message.mine) { BubbleTail(mine = true); Spacer(Modifier.width(6.dp)); ChatAvatar(message, avatarData, editable = true, onClick = onAvatarClick) }
+            if (message.mine) { if (!visualMessage) BubbleTail(mine = true); Spacer(Modifier.width(6.dp)); ChatAvatar(message, avatarData, editable = true, onClick = onAvatarClick) }
         }
         // 发送时间（气泡底部）
         Row(
@@ -3956,17 +4085,17 @@ private fun ChatBubble(
                 )
                 if (message.type == "voice" && message.imageBase64 != null) {
                     DropdownMenuItem(
-                        leadingIcon = { Icon(Icons.Rounded.Mic, null, tint = GrassGreen) },
                         text = { Text(L("语音转文字", "Transcribe voice")) },
                         onClick = {
                             showActions = false
                             transcribingVoice = true
                             voiceTranscript = null
                             voiceTranscriptError = null
-                            VoiceMessageTranscriber.transcribe(context, message.imageBase64) { result ->
+                            transcriptionStatus = ""
+                            VoiceMessageTranscriber.transcribe(context, message.imageBase64, onProgress = { transcriptionStatus = it }) { result ->
                                 transcribingVoice = false
                                 result.onSuccess { voiceTranscript = it }.onFailure {
-                                    voiceTranscriptError = L("无法识别此语音，请确认系统已安装对应的离线语音识别服务（需要 Android 13 或更高版本）", "Unable to transcribe this message. Install the matching offline speech service (Android 13 or newer required)")
+                                    voiceTranscriptError = it.message ?: L("离线语音识别失败，请重试", "Offline transcription failed. Please try again.")
                                 }
                             }
                         },
@@ -3985,7 +4114,7 @@ private fun ChatBubble(
                         )
                     }
                     DropdownMenuItem(
-                        leadingIcon = { Icon(Icons.Rounded.Download, null, tint = GrassGreen) },
+                        leadingIcon = { Icon(Icons.Rounded.Download, null, tint = AccentText) },
                         text = { Text(L("下载文件", "Download file")) },
                         onClick = {
                             showActions = false
@@ -4745,7 +4874,7 @@ private fun SettingsPanel(state: MctierUiState, repository: MctierRepository) {
                 onClick = { downloadFolderLauncher.launch(null) },
                 modifier = Modifier.weight(1f).height(44.dp),
                 shape = RoundedCornerShape(12.dp),
-                colors = ButtonDefaults.buttonColors(containerColor = GrassGreen, contentColor = TextPrimary),
+                colors = ButtonDefaults.buttonColors(containerColor = GrassGreen, contentColor = OnAccent),
             ) {
                 Icon(Icons.Rounded.Folder, null, modifier = Modifier.size(18.dp))
                 Spacer(Modifier.width(6.dp))
@@ -5620,7 +5749,7 @@ private fun PrimaryButton(text: String, enabled: Boolean = true, icon: ImageVect
         onClick = onClick, enabled = enabled,
         modifier = Modifier.fillMaxWidth().height(52.dp), shape = RoundedCornerShape(14.dp),
         colors = ButtonDefaults.buttonColors(
-            containerColor = GrassGreen, contentColor = TextPrimary,
+            containerColor = GrassGreen, contentColor = OnAccent,
             disabledContainerColor = PanelHigh, disabledContentColor = TextPrimary.copy(alpha = 0.4f),
         ),
     ) {
@@ -6381,7 +6510,7 @@ private fun HostActionChip(text: String, icon: ImageVector, danger: Boolean, mod
 private fun fieldColors() = OutlinedTextFieldDefaults.colors(
     focusedBorderColor = GrassGreen,
     unfocusedBorderColor = Hairline,
-    focusedLabelColor = GrassGreen,
+    focusedLabelColor = AccentText,
     unfocusedLabelColor = TextPrimary.copy(alpha = 0.5f),
     focusedTextColor = TextPrimary,
     unfocusedTextColor = TextPrimary,

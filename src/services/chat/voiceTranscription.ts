@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core';
+import { Channel, invoke } from '@tauri-apps/api/core';
 
 const TARGET_SAMPLE_RATE = 16_000;
 
@@ -22,7 +22,7 @@ function pcm16Wav(channel: Float32Array, sampleRate: number): number[] {
   return Array.from(bytes);
 }
 
-export async function transcribeVoiceMessage(dataUrl: string, language: string): Promise<string> {
+export async function transcribeVoiceMessage(dataUrl: string, language: string, onProgress?: (completed: number, total: number) => void): Promise<string> {
   const response = await fetch(dataUrl);
   const encoded = await response.arrayBuffer();
   const context = new AudioContext();
@@ -33,9 +33,12 @@ export async function transcribeVoiceMessage(dataUrl: string, language: string):
       const channel = decoded.getChannelData(channelIndex);
       for (let index = 0; index < mono.length; index += 1) mono[index] += channel[index] / decoded.numberOfChannels;
     }
+    const progress = new Channel<{ completed: number; total: number }>();
+    progress.onmessage = value => onProgress?.(value.completed, value.total);
     return await invoke<string>('transcribe_voice_message', {
       wavData: pcm16Wav(mono, decoded.sampleRate),
       language: language.startsWith('en') ? 'en-US' : 'zh-CN',
+      progress,
     });
   } finally {
     await context.close();

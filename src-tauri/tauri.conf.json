@@ -58,7 +58,8 @@
         ],
         "font-src": [
           "'self'",
-          "data:"
+          "data:",
+          "blob:"
         ],
         "worker-src": [
           "'self'",
@@ -126,6 +127,7 @@
         "font-src": [
           "'self'",
           "data:",
+          "blob:",
           "http://localhost:1420"
         ],
         "worker-src": [
@@ -162,7 +164,7 @@
       ],
       "assetProtocol": {
         "enable": true,
-        "scope": ["$APPCACHE/emoji-builtin-v1/**", "$APPCACHE/chat-attachments/**"]
+        "scope": ["$APPCACHE/emoji-builtin-v1/**", "$APPCACHE/chat-attachments/**", "$APPCACHE/office-previews/**"]
       }
     },
     "withGlobalTauri": false

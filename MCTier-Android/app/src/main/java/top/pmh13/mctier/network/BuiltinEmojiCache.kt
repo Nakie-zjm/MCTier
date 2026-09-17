@@ -2,6 +2,8 @@ package top.pmh13.mctier.network
 
 import android.content.Context
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
@@ -14,52 +16,69 @@ import okhttp3.Request
 import top.pmh13.mctier.data.CustomEmojiItem
 import java.io.File
 import java.io.InputStream
+import java.io.IOException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
-class BuiltinEmojiCache(context: Context) {
-    private val root = File(context.filesDir, "emoji-library-v1")
+class BuiltinEmojiCache internal constructor(private val root: File, private val client: OkHttpClient) {
+    constructor(context: Context) : this(File(context.filesDir, "emoji-library-v1"), defaultClient())
     private val cacheDirectory = File(root, "builtin")
     private val marker = File(cacheDirectory, "complete-v1.txt")
+    private val index = File(cacheDirectory, "index-v1.txt")
     private val syncMutex = Mutex()
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(12, TimeUnit.SECONDS)
-        .readTimeout(35, TimeUnit.SECONDS)
-        .callTimeout(35, TimeUnit.SECONDS)
-        .followRedirects(false)
-        .followSslRedirects(false)
-        .build()
 
-    fun cachedItems(): List<CustomEmojiItem> {
-        if (!marker.isFile || marker.length() !in 1..MaxMarkerBytes.toLong()) return emptyList()
-        val ids = runCatching { marker.readLines() }.getOrNull()
+    private fun readIndex(file: File): List<String> {
+        if (!file.isFile || file.length() !in 1..MaxMarkerBytes.toLong()) return emptyList()
+        val ids = runCatching { file.readLines() }.getOrNull()
             ?.filter { it.isNotBlank() }
             ?: return emptyList()
         if (ids.size !in MinEmojiCount..MaxEmojiCount || ids.distinct().size != ids.size) return emptyList()
-        if (ids.any { !SafeId.matches(it) || !validGif(File(cacheDirectory, "$it.gif")) }) return emptyList()
-        return items(ids)
+        if (ids.any { !SafeId.matches(it) }) return emptyList()
+        return ids
+    }
+
+    fun cachedItems(): List<CustomEmojiItem> = items(
+        readIndex(index).ifEmpty { readIndex(marker) }.filter { validGif(File(cacheDirectory, "$it.gif")) }
+    )
+
+    fun isComplete(): Boolean = readIndex(marker).let { ids ->
+        ids.isNotEmpty() && ids.all { validGif(File(cacheDirectory, "$it.gif")) }
     }
 
     suspend fun sync(onProgress: (downloaded: Int, total: Int) -> Unit = { _, _ -> }): List<CustomEmojiItem> = syncMutex.withLock {
-        cachedItems().takeIf { it.isNotEmpty() }?.let {
+        cachedItems().takeIf { isComplete() }?.let {
             onProgress(it.size, it.size)
             return@withLock it
         }
         check(cacheDirectory.mkdirs() || cacheDirectory.isDirectory) { "无法创建内置表情缓存目录" }
 
-        val pageBytes = download(SourcePage, MaxPageBytes)
-        val ids = parseIds(pageBytes.toString(Charsets.UTF_8))
-        val completed = AtomicInteger(0)
-        onProgress(0, ids.size)
-        coroutineScope {
-            val semaphore = Semaphore(DownloadConcurrency)
-            ids.map { id ->
-                async(Dispatchers.IO) {
-                    semaphore.withPermit { downloadGif(id) }
-                    onProgress(completed.incrementAndGet(), ids.size)
-                }
-            }.awaitAll()
+        val ids = readIndex(index).ifEmpty {
+            parseIds(withRetry { download(SourcePage, MaxPageBytes) }.toString(Charsets.UTF_8)).also {
+                val temporaryIndex = File(cacheDirectory, "index-v1.tmp")
+                temporaryIndex.writeText(it.joinToString("\n"))
+                check(replace(temporaryIndex, index)) { "无法保存内置表情下载索引" }
+            }
         }
+        val pending = ids.filterNot { validGif(File(cacheDirectory, "$it.gif")) }
+        val completed = AtomicInteger(ids.size - pending.size)
+        onProgress(completed.get(), ids.size)
+        val failures = coroutineScope {
+            val semaphore = Semaphore(DownloadConcurrency)
+            pending.map { id ->
+                async(Dispatchers.IO) {
+                    try {
+                        semaphore.withPermit { withRetry { downloadGif(id) } }
+                        synchronized(completed) { onProgress(completed.incrementAndGet(), ids.size) }
+                        null
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (error: Exception) {
+                        error
+                    }
+                }
+            }.awaitAll().filterNotNull()
+        }
+        check(failures.isEmpty()) { "已缓存 ${completed.get()}/${ids.size} 个表情，${failures.size} 个待重试：${failures.first().message}" }
 
         val temporaryMarker = File(cacheDirectory, "complete-v1.tmp")
         temporaryMarker.writeText(ids.joinToString("\n"))
@@ -83,6 +102,7 @@ class BuiltinEmojiCache(context: Context) {
             .header("User-Agent", "MCTier/3.4 emoji-cache")
             .build()
         return client.newCall(request).execute().use { response ->
+            if (response.code == 408 || response.code == 429 || response.code >= 500) throw IOException("HTTP ${response.code}")
             check(response.isSuccessful) { "下载内置表情失败: HTTP ${response.code}" }
             val body = checkNotNull(response.body) { "下载内置表情失败: 空响应" }
             val contentLength = body.contentLength()
@@ -124,14 +144,28 @@ class BuiltinEmojiCache(context: Context) {
     }
 
     internal companion object {
+        private fun defaultClient() = OkHttpClient.Builder()
+            .connectTimeout(12, TimeUnit.SECONDS)
+            .readTimeout(35, TimeUnit.SECONDS)
+            .callTimeout(35, TimeUnit.SECONDS)
+            .followRedirects(false)
+            .followSslRedirects(false)
+            .build()
+
+        private suspend fun <T> withRetry(action: () -> T): T {
+            repeat(2) { attempt ->
+                try { return action() } catch (error: IOException) { delay(500L * (attempt + 1)) }
+            }
+            return action()
+        }
         private const val SourcePage = "https://www.emojiall.com/zh-hans/image-emoji-platform/telegram/animation"
         private const val AssetRoot = "https://www.emojiall.com/images/120/telegram"
         private const val MaxPageBytes = 2 * 1024 * 1024
-        private const val MaxGifBytes = 2 * 1024 * 1024
+        private const val MaxGifBytes = 4 * 1024 * 1024
         private const val MaxMarkerBytes = 128 * 1024
         private const val MinEmojiCount = 100
         private const val MaxEmojiCount = 2_000
-        private const val DownloadConcurrency = 8
+        private const val DownloadConcurrency = 10
         private val SafeId = Regex("^[A-Za-z0-9_-]+$")
         private val AssetPattern = Regex("/images/120/telegram/([A-Za-z0-9_-]+)\\.gif")
 

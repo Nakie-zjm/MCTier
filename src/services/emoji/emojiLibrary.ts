@@ -27,6 +27,8 @@ interface NativeBuiltinEmoji {
 export interface BuiltinEmojiProgress {
   downloaded: number;
   total: number;
+  retryAfterSeconds?: number;
+  error?: string;
 }
 
 const DB_NAME = 'mctier-emoji-library-v1';
@@ -36,6 +38,12 @@ const RECENT_KEY = 'mctier.emoji.recent.v1';
 const MAX_CUSTOM_ITEMS = 300;
 const MAX_RECENT = 32;
 let builtinLoad: Promise<EmojiItem[]> | null = null;
+const builtinProgressListeners = new Set<(progress: BuiltinEmojiProgress) => void>();
+let builtinProgress: BuiltinEmojiProgress = { downloaded: 0, total: 0 };
+function publishBuiltinProgress(progress: BuiltinEmojiProgress) {
+  builtinProgress = progress;
+  builtinProgressListeners.forEach(listener => listener(progress));
+}
 
 const defaultCategories: EmojiCategory[] = [
   { id: 'recent', name: '最近', builtin: true },
@@ -151,11 +159,31 @@ export async function deleteCustomEmoji(id: string): Promise<void> {
   localStorage.setItem(RECENT_KEY, JSON.stringify(getRecentEmojiIds().filter((itemId) => itemId !== id)));
 }
 
-export async function syncBuiltinEmojiItems(retry = false, onProgress?: (progress: BuiltinEmojiProgress) => void): Promise<EmojiItem[]> {
-  const unlisten = onProgress ? await listen<BuiltinEmojiProgress>('builtin-emoji-progress', (event) => onProgress(event.payload)) : null;
+export async function syncBuiltinEmojiItems(_retry = false, onProgress?: (progress: BuiltinEmojiProgress) => void, signal?: AbortSignal): Promise<EmojiItem[]> {
+  const detach = () => { if (onProgress) builtinProgressListeners.delete(onProgress); };
+  if (onProgress && !signal?.aborted) { builtinProgressListeners.add(onProgress); onProgress(builtinProgress); }
+  signal?.addEventListener('abort', detach, { once: true });
   try {
-    if (retry || !builtinLoad) {
-      builtinLoad = invoke<NativeBuiltinEmoji[]>('sync_builtin_emoji').then((items) => items.map((item) => ({
+    if (!builtinLoad) {
+      builtinLoad = (async () => {
+        const unlisten = await listen<BuiltinEmojiProgress>('builtin-emoji-progress', event => publishBuiltinProgress({
+          ...event.payload, downloaded: Math.max(builtinProgress.downloaded, event.payload.downloaded),
+        }));
+        try {
+          let failures = 0;
+          for (;;) {
+            try {
+              const items = await invoke<NativeBuiltinEmoji[]>('sync_builtin_emoji');
+              publishBuiltinProgress({ downloaded: items.length, total: items.length });
+              return items;
+            } catch (error) {
+              const seconds = Math.min(60, 2 ** Math.min(++failures, 6));
+              publishBuiltinProgress({ ...builtinProgress, retryAfterSeconds: seconds, error: String(error) });
+              await new Promise(resolve => setTimeout(resolve, seconds * 1000));
+            }
+          }
+        } finally { unlisten(); }
+      })().then((items) => items.map((item) => ({
       id: item.id,
       categoryId: 'builtin',
       name: item.name,
@@ -163,11 +191,12 @@ export async function syncBuiltinEmojiItems(retry = false, onProgress?: (progres
       dataUrl: convertFileSrc(item.path),
       createdAt: 0,
       builtin: true,
-      })));
+      }))).catch(error => { builtinLoad = null; throw error; });
     }
     return await builtinLoad;
   } finally {
-    unlisten?.();
+    detach();
+    signal?.removeEventListener('abort', detach);
   }
 }
 

@@ -17,6 +17,8 @@ import type {
 import { applyMessageRecall } from '../services/chat/recallPolicy';
 import { compareChatMessages } from '../services/chat/messageOrder';
 import { recordUnread, readConversation, type ChatUnread } from '../services/chat/unread';
+import { loadPeerPreferences, savePeerPreferences, updatePeerPreference, type PeerPreference, type PeerPreferences } from '../services/chat/peerPreferences';
+import { showFeedback } from '../services/ui/feedback';
 import type { SignalingConnectionStatus } from '../services/signaling/registeredSocket';
 
 /** 共享待办项（双端字段名一致） */
@@ -33,6 +35,8 @@ export interface TodoItem {
  * 应用程序 Store 接口定义
  */
 interface AppStore {
+  peerPreferences: PeerPreferences;
+  setPeerPreference: (id: string, patch: Partial<PeerPreference>) => boolean;
   // ==================== 应用状态 ====================
   /** 当前应用状态 */
   appState: AppState;
@@ -290,6 +294,7 @@ const initialState = {
   // 聊天室
   chatMessages: [],
   unreadChatMessages: {} as ChatUnread,
+  peerPreferences: loadPeerPreferences(),
   activeChatConversation: null as string | null,
 
   // 大厅公告 / 语音小队
@@ -662,10 +667,25 @@ export const useAppStore = create<AppStore>()(
 
       // ==================== 聊天室操作 ====================
       setActiveChatConversation: (conversation) => {
+        if (conversation?.startsWith('private:')) {
+          const id = conversation.slice(8);
+          if (get().peerPreferences[id]?.markedUnread) get().setPeerPreference(id, { markedUnread: false });
+        }
         set((state) => ({
           activeChatConversation: conversation,
           unreadChatMessages: readConversation(state.unreadChatMessages, conversation),
         }), false, 'setActiveChatConversation');
+      },
+      setPeerPreference: (id, patch) => {
+        try {
+          const peerPreferences = updatePeerPreference(get().peerPreferences, id, patch);
+          savePeerPreferences(peerPreferences);
+          set({ peerPreferences }, false, 'setPeerPreference');
+          return true;
+        } catch {
+          showFeedback('error', '无法保存私信设置，请检查本地存储');
+          return false;
+        }
       },
       addChatMessage: (message: ChatMessage) => {
         set(
@@ -774,6 +794,7 @@ export const useAppStore = create<AppStore>()(
         set(
           {
             ...initialState,
+            peerPreferences: get().peerPreferences,
             // 重新创建 Set 对象，避免引用问题
             mutedPlayers: new Set<string>(),
             playerVolumes: new Map<string, number>(),

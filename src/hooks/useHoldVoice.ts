@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { MAX_VOICE_BYTES } from '../services/chat/voiceMessage';
 import { captureVoiceStream } from '../services/voice/nvidiaNoise';
+import { lobbyCaptureGate } from '../services/voice/lobbyCaptureGate';
 
 export function useHoldVoice(enabled: boolean, send: (blob: Blob, duration: number) => Promise<void>, failed: () => void, context: string) {
   const [seconds, setSeconds] = useState<number | null>(null);
@@ -12,6 +13,7 @@ export function useHoldVoice(enabled: boolean, send: (blob: Blob, duration: numb
   const startY = useRef(0);
   const cancelled = useRef(false);
   const started = useRef(0);
+  const releaseLobby = useRef<(() => void) | null>(null);
   const job = useRef<{ cancelled: boolean } | null>(null);
   const sendRef = useRef(send);
   sendRef.current = send;
@@ -27,10 +29,17 @@ export function useHoldVoice(enabled: boolean, send: (blob: Blob, duration: numb
     if (job.current) job.current.cancelled = cancel;
     job.current = null;
     recorder.current = null;
-    if (active && active.state !== 'inactive') active.stop();
-    active?.stream.getTracks().forEach(track => track.stop());
-    setSeconds(null);
-    setCancelling(false);
+    try {
+      if (active && active.state !== 'inactive') active.stop();
+    } catch {
+      failed();
+    } finally {
+      active?.stream.getTracks().forEach(track => track.stop());
+      releaseLobby.current?.();
+      releaseLobby.current = null;
+      setSeconds(null);
+      setCancelling(false);
+    }
   };
 
   useEffect(() => {
@@ -60,9 +69,11 @@ export function useHoldVoice(enabled: boolean, send: (blob: Blob, duration: numb
         const ticket = ++generation.current;
         pending.current = setTimeout(async () => {
           let stream: MediaStream | null = null;
+          const release = lobbyCaptureGate.suspend();
+          releaseLobby.current = release;
           try {
             stream = await captureVoiceStream();
-            if (ticket !== generation.current) { stream.getTracks().forEach(t => t.stop()); return; }
+            if (ticket !== generation.current) { stream.getTracks().forEach(t => t.stop()); release(); return; }
             const mimeType = ['audio/webm;codecs=opus', 'audio/ogg;codecs=opus', 'audio/mp4'].find(t => MediaRecorder.isTypeSupported(t));
             if (!mimeType) { stream.getTracks().forEach(t => t.stop()); throw new Error('No voice codec'); }
             const active = new MediaRecorder(stream, { mimeType, audioBitsPerSecond: 32000 });
@@ -79,7 +90,7 @@ export function useHoldVoice(enabled: boolean, send: (blob: Blob, duration: numb
               const blob = new Blob(chunks, { type: mimeType.split(';')[0] });
               if (!currentJob.cancelled && duration >= 0.5 && blob.size > 0 && blob.size <= MAX_VOICE_BYTES) {
                 void sendRecording(blob, duration).catch(failed);
-              }
+              } else if (!currentJob.cancelled) failed();
             };
             started.current = performance.now();
             active.start();
@@ -91,6 +102,7 @@ export function useHoldVoice(enabled: boolean, send: (blob: Blob, duration: numb
             }, 100);
           } catch {
             stream?.getTracks().forEach(track => track.stop());
+            release();
             if (ticket === generation.current) { finish(true); failed(); }
           }
         }, 400);

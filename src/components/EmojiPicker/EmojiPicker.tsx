@@ -19,15 +19,15 @@ import {
   updateCustomEmoji,
   type EmojiCategory,
   type EmojiItem,
+  type BuiltinEmojiProgress,
 } from '../../services/emoji/emojiLibrary';
 import './EmojiPicker.css';
 
 interface EmojiPickerProps {
   onSelect: (emoji: EmojiItem) => void | Promise<void>;
-  onClose: () => void;
 }
 
-export const EmojiPicker: React.FC<EmojiPickerProps> = ({ onSelect, onClose }) => {
+export const EmojiPicker: React.FC<EmojiPickerProps> = ({ onSelect }) => {
   const [categories, setCategories] = useState<EmojiCategory[]>(() => getEmojiCategories());
   const [items, setItems] = useState<EmojiItem[]>([]);
   const [activeCategory, setActiveCategory] = useState('recent');
@@ -37,7 +37,7 @@ export const EmojiPicker: React.FC<EmojiPickerProps> = ({ onSelect, onClose }) =
   const [busy, setBusy] = useState(false);
   const [builtinSyncing, setBuiltinSyncing] = useState(true);
   const [builtinError, setBuiltinError] = useState(false);
-  const [builtinProgress, setBuiltinProgress] = useState({ downloaded: 0, total: 0 });
+  const [builtinProgress, setBuiltinProgress] = useState<BuiltinEmojiProgress>({ downloaded: 0, total: 0 });
   const [managedEmoji, setManagedEmoji] = useState<EmojiItem | null>(null);
   const [managedEmojiName, setManagedEmojiName] = useState('');
   const [managedEmojiCategory, setManagedEmojiCategory] = useState('custom');
@@ -48,21 +48,24 @@ export const EmojiPicker: React.FC<EmojiPickerProps> = ({ onSelect, onClose }) =
     const custom = await getCustomEmojiItems();
     setItems((current) => [...current.filter((item) => item.builtin), ...custom]);
   };
-  const loadBuiltin = async (retry = false) => {
+  const loadBuiltin = async (retry = false, signal?: AbortSignal) => {
     setBuiltinSyncing(true);
     setBuiltinError(false);
     try {
-      const builtin = await syncBuiltinEmojiItems(retry, setBuiltinProgress);
+      const builtin = await syncBuiltinEmojiItems(retry, setBuiltinProgress, signal);
+      if (signal?.aborted) return;
       setItems((current) => [...builtin, ...current.filter((item) => !item.builtin)]);
     } catch {
-      setBuiltinError(true);
+      if (!signal?.aborted) setBuiltinError(true);
     } finally {
-      setBuiltinSyncing(false);
+      if (!signal?.aborted) setBuiltinSyncing(false);
     }
   };
   useEffect(() => {
+    const controller = new AbortController();
     void refreshCustom();
-    void loadBuiltin();
+    void loadBuiltin(false, controller.signal);
+    return () => controller.abort();
   }, []);
 
   const visibleItems = useMemo(() => {
@@ -184,12 +187,7 @@ export const EmojiPicker: React.FC<EmojiPickerProps> = ({ onSelect, onClose }) =
   };
 
   return (
-    <motion.div className="emoji-picker-overlay" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={onClose}>
-      <motion.section className="emoji-picker" role="dialog" aria-label={tl('表情库', 'Emoji library')} initial={{ scale: 0.96, opacity: 0, y: 12 }} animate={{ scale: 1, opacity: 1, y: 0 }} onClick={(event) => event.stopPropagation()}>
-        <header className="emoji-picker-header">
-          <div><strong>{tl('表情库', 'Emoji library')}</strong><span>{tl('点击即可发送', 'Click to send')}</span></div>
-          <button className="emoji-icon-button" type="button" onClick={onClose} aria-label={tl('关闭', 'Close')}><CloseOutlined /></button>
-        </header>
+      <motion.section className="emoji-picker" role="region" aria-label={tl('表情库', 'Emoji library')} initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }}>
         <div className="emoji-category-bar">
           <nav className="emoji-categories" aria-label={tl('表情分类', 'Emoji categories')} onWheel={(event) => {
             if (Math.abs(event.deltaY) <= Math.abs(event.deltaX)) return;
@@ -199,6 +197,8 @@ export const EmojiPicker: React.FC<EmojiPickerProps> = ({ onSelect, onClose }) =
             {categories.map((category) => <button key={category.id} type="button" className={activeCategory === category.id ? 'active' : ''} onClick={() => setActiveCategory(category.id)}>{category.name}</button>)}
           </nav>
           <div className="emoji-category-actions">
+            <input ref={inputRef} type="file" hidden multiple accept="image/gif,image/png,image/jpeg,image/webp" onChange={(event) => { void upload(event.target.files); event.currentTarget.value = ''; }} />
+            <button type="button" className="emoji-category-add" disabled={busy} onClick={() => inputRef.current?.click()} title={tl('批量导入', 'Import images')} aria-label={tl('批量导入', 'Import images')}>{busy ? <LoadingOutlined /> : <UploadOutlined />}</button>
             <button type="button" className="emoji-category-add" onClick={() => setCreating(true)} aria-label={tl('新建分类', 'New category')}><FolderAddOutlined /></button>
             {active && !active.builtin && <button type="button" className="emoji-category-add" onClick={beginEdit} aria-label={tl('管理当前分类', 'Manage category')}><EditOutlined /></button>}
           </div>
@@ -215,12 +215,14 @@ export const EmojiPicker: React.FC<EmojiPickerProps> = ({ onSelect, onClose }) =
           <button type="button" onClick={() => setEditing(false)}><CloseOutlined /></button>
         </div>}
         <div className="emoji-grid">
+          {activeCategory === 'builtin' && builtinProgress.retryAfterSeconds && <div className="emoji-download-status" role="status">{tl(`下载暂时中断，${builtinProgress.retryAfterSeconds} 秒后自动重试`, `Download interrupted. Retrying in ${builtinProgress.retryAfterSeconds}s`)}</div>}
           {visibleItems.map((emoji) => <div key={emoji.id} className="emoji-tile" onContextMenu={(event) => { if (!isCustomEmoji(emoji)) return; event.preventDefault(); beginEmojiManagement(emoji); }}>
             <button className="emoji-btn" type="button" title={emoji.name} onClick={async () => {
               try {
                 await onSelect(emoji);
                 rememberRecentEmoji(emoji.id);
-                onClose();
+                // Keep the panel open for consecutive sends and refresh Recent.
+                setItems((current) => [...current]);
               } catch {
                 // The caller owns the user-facing send error so it can include chat context.
               }
@@ -245,12 +247,6 @@ export const EmojiPicker: React.FC<EmojiPickerProps> = ({ onSelect, onClose }) =
             </footer>
           </section>
         </div>}
-        <footer className="emoji-picker-footer">
-          <input ref={inputRef} type="file" hidden multiple accept="image/gif,image/png,image/jpeg,image/webp" onChange={(event) => { void upload(event.target.files); event.currentTarget.value = ''; }} />
-          <button type="button" disabled={busy} onClick={() => inputRef.current?.click()}><UploadOutlined />{busy ? tl('正在导入...', 'Importing...') : tl('批量导入', 'Import images')}</button>
-          <span>{tl('支持 GIF、PNG、JPG、WebP', 'GIF, PNG, JPG and WebP')}</span>
-        </footer>
       </motion.section>
-    </motion.div>
   );
 };
