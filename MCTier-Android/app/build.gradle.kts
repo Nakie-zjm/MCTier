@@ -3,6 +3,7 @@ import org.gradle.api.tasks.testing.Test
 import org.gradle.api.tasks.JavaExec
 import java.security.MessageDigest
 import java.net.URI
+import java.util.zip.GZIPOutputStream
 
 plugins {
     id("com.android.application")
@@ -20,8 +21,8 @@ android {
         testInstrumentationRunner = "top.pmh13.mctier.PeerUiInstrumentation"
         minSdk = 26
         targetSdk = 36
-        versionCode = 78
-        versionName = "3.5.0-android"
+        versionCode = 82
+        versionName = "3.5.1-android"
         ndk {
             // The bundled LocalVQE engine is currently built for the primary
             // Android ABI; unsupported ABIs retain the WebRTC hardware AEC/NS path.
@@ -74,6 +75,21 @@ val syncLicenseAssets by tasks.registering(Sync::class) {
 }
 
 android.sourceSets.getByName("main").assets.srcDir(licenseAssetDir)
+val builtinEmojiPack = rootProject.projectDir.parentFile.resolve("shared/builtin-emoji/builtin-v3.pack.gz")
+val builtinEmojiAssetDir = layout.buildDirectory.dir("generated/builtinEmojiAssets")
+val prepareBuiltinEmojiAsset by tasks.registering {
+    description = "Wrap the builtin emoji gzip once so Android preserves the .pack.gz asset name and bytes."
+    inputs.file(builtinEmojiPack)
+    outputs.file(builtinEmojiAssetDir.map { it.file("builtin-v3.pack.gz.gz") })
+    doLast {
+        val destination = builtinEmojiAssetDir.get().file("builtin-v3.pack.gz.gz").asFile
+        destination.parentFile.mkdirs()
+        GZIPOutputStream(destination.outputStream().buffered()).use { output ->
+            builtinEmojiPack.inputStream().buffered().use { input -> input.copyTo(output) }
+        }
+    }
+}
+android.sourceSets.getByName("main").assets.srcDir(builtinEmojiAssetDir)
 val prepareSpeechModel by tasks.registering(Exec::class) {
     workingDir(rootProject.projectDir.parentFile)
     commandLine("node", "scripts/prepare-speech-model.mjs")
@@ -89,6 +105,7 @@ android.sourceSets.getByName("main").assets.srcDir(rootProject.projectDir.parent
 tasks.matching { it.name.startsWith("merge") && it.name.endsWith("Assets") }.configureEach {
     dependsOn(syncLicenseAssets)
     dependsOn(prepareSpeechModel)
+    dependsOn(prepareBuiltinEmojiAsset)
 }
 val buildFilePreview by tasks.registering(Exec::class) {
     workingDir(rootProject.projectDir.parentFile)

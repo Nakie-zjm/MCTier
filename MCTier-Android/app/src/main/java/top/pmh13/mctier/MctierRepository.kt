@@ -368,7 +368,6 @@ class MctierRepository(private val context: Context) {
 
     init {
         clearAvatarCacheOnStartup()
-        if (!builtinEmojiCache.isComplete()) syncBuiltinEmoji()
         scope.launch { signalingClient.events.collect { handleSignal(it) } }
         // 应用已保存的音效/免打扰设置
         soundManager.applySettings(_state.value.settings)
@@ -3043,7 +3042,8 @@ class MctierRepository(private val context: Context) {
 
     fun sendEmoji(item: CustomEmojiItem, recipientId: String? = null, onResult: (Boolean) -> Unit = {}) {
         ioScope.launch {
-            val bytes = runCatching { java.io.File(context.filesDir, "emoji-library-v1/${item.fileName}").readBytes() }.getOrNull()
+            val library = if (item.categoryId == "builtin") "emoji-library-v3" else "emoji-library-v1"
+            val bytes = runCatching { java.io.File(context.filesDir, "$library/${item.fileName}").readBytes() }.getOrNull()
             if (bytes == null || !sendImageBytes(bytes, recipientId, "[表情]")) {
                 withContext(Dispatchers.Main) { onResult(false) }
                 return@launch
@@ -3056,6 +3056,8 @@ class MctierRepository(private val context: Context) {
             }
         }
     }
+
+    fun ensureBuiltinEmoji() = syncBuiltinEmoji()
 
     fun retryBuiltinEmojiSync() = syncBuiltinEmoji()
 

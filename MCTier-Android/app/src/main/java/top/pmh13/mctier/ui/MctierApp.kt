@@ -2963,7 +2963,10 @@ private fun ChatTab(state: MctierUiState, repository: MctierRepository) {
                         Box(
                             Modifier.clip(RoundedCornerShape(14.dp))
                                 .background(if (active) GrassGreen else PanelHigh)
-                                .clickable { emojiCat = category.id }
+                                .clickable {
+                                    emojiCat = category.id
+                                    if (category.id == "builtin") repository.ensureBuiltinEmoji()
+                                }
                                 .padding(horizontal = 14.dp, vertical = 6.dp),
                         ) { Text(category.name, color = if (active) OnAccent else TextPrimary, fontSize = 13.sp, fontWeight = if (active) FontWeight.Bold else FontWeight.Normal) }
                     }
@@ -2997,16 +3000,16 @@ private fun ChatTab(state: MctierUiState, repository: MctierRepository) {
                             )
                             Spacer(Modifier.height(6.dp))
                             Text(
-                                L("已下载 ${state.emojiBuiltinDownloaded} / ${state.emojiBuiltinTotal}，剩余 ${(state.emojiBuiltinTotal - state.emojiBuiltinDownloaded).coerceAtLeast(0)}", "${state.emojiBuiltinDownloaded} / ${state.emojiBuiltinTotal} downloaded, ${(state.emojiBuiltinTotal - state.emojiBuiltinDownloaded).coerceAtLeast(0)} remaining"),
+                                L("已解压 ${state.emojiBuiltinDownloaded} / ${state.emojiBuiltinTotal}", "${state.emojiBuiltinDownloaded} / ${state.emojiBuiltinTotal} extracted"),
                                 color = TextPrimary.copy(alpha = .72f), fontSize = 11.sp,
                             )
                             Spacer(Modifier.height(4.dp))
                         }
                         Text(
                             when {
-                                emojiCat == "builtin" && state.emojiBuiltinError != null && state.emojiBuiltinSyncing -> L("下载暂时中断，正在自动重试", "Download interrupted. Retrying automatically")
-                                emojiCat == "builtin" && state.emojiBuiltinSyncing -> L("正在准备内置表情...", "Preparing built-in emoji...")
-                                emojiCat == "builtin" && state.emojiBuiltinError != null -> L("内置表情下载失败", "Built-in emoji download failed")
+                                emojiCat == "builtin" && state.emojiBuiltinError != null && state.emojiBuiltinSyncing -> L("内置表情准备中断，正在重试", "Built-in emoji preparation interrupted; retrying")
+                                emojiCat == "builtin" && state.emojiBuiltinSyncing -> L("正在解压内置表情...", "Extracting built-in emoji...")
+                                emojiCat == "builtin" && state.emojiBuiltinError != null -> L("内置表情准备失败", "Built-in emoji preparation failed")
                                 emojiCat == "builtin" -> L("内置表情资源尚未安装", "Built-in emoji are not installed")
                                 else -> L("这里还没有表情", "No emoji here yet")
                             },
@@ -3026,12 +3029,12 @@ private fun ChatTab(state: MctierUiState, repository: MctierRepository) {
                     if (emojiCat == "builtin" && (state.emojiBuiltinSyncing || state.emojiBuiltinError != null)) {
                         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                             Text(
-                                if (state.emojiBuiltinSyncing && state.emojiBuiltinError != null) L("正在自动重试，已缓存 ${state.emojiBuiltinDownloaded}/${state.emojiBuiltinTotal}", "Retrying automatically, ${state.emojiBuiltinDownloaded}/${state.emojiBuiltinTotal} cached")
-                                else if (state.emojiBuiltinSyncing) L("正在补全表情 ${state.emojiBuiltinDownloaded}/${state.emojiBuiltinTotal}", "Downloading ${state.emojiBuiltinDownloaded}/${state.emojiBuiltinTotal}")
+                                if (state.emojiBuiltinSyncing && state.emojiBuiltinError != null) L("正在重试，已解压 ${state.emojiBuiltinDownloaded}/${state.emojiBuiltinTotal}", "Retrying, ${state.emojiBuiltinDownloaded}/${state.emojiBuiltinTotal} extracted")
+                                else if (state.emojiBuiltinSyncing) L("正在解压表情 ${state.emojiBuiltinDownloaded}/${state.emojiBuiltinTotal}", "Extracting ${state.emojiBuiltinDownloaded}/${state.emojiBuiltinTotal}")
                                 else state.emojiBuiltinError.orEmpty(),
                                 modifier = Modifier.weight(1f), color = TextPrimary.copy(alpha = .65f), fontSize = 11.sp, maxLines = 2, overflow = TextOverflow.Ellipsis,
                             )
-                            if (!state.emojiBuiltinSyncing) TextButton(onClick = repository::retryBuiltinEmojiSync) { Text(L("继续下载", "Resume"), color = AccentText) }
+                            if (!state.emojiBuiltinSyncing) TextButton(onClick = repository::retryBuiltinEmojiSync) { Text(L("重试准备", "Retry"), color = AccentText) }
                         }
                     }
                     FlowRow(
@@ -3040,6 +3043,7 @@ private fun ChatTab(state: MctierUiState, repository: MctierRepository) {
                     ) {
                         visibleEmoji.forEach { emoji ->
                             val manageable = emoji.categoryId != "builtin"
+                            val library = if (emoji.categoryId == "builtin") "emoji-library-v3" else "emoji-library-v1"
                             Box(
                                 Modifier.size(58.dp).clip(RoundedCornerShape(8.dp)).background(PanelHigh)
                                     .combinedClickable(
@@ -3055,9 +3059,9 @@ private fun ChatTab(state: MctierUiState, repository: MctierRepository) {
                                             confirmEmojiDelete = false
                                         }) else null,
                                     ),
-                            ) {
-                                AsyncImage(
-                                    model = java.io.File(context.filesDir, "emoji-library-v1/${emoji.fileName}"), imageLoader = animatedImageLoader,
+                                ) {
+                                    AsyncImage(
+                                        model = java.io.File(context.filesDir, "$library/${emoji.fileName}"), imageLoader = animatedImageLoader,
                                     contentDescription = if (manageable) L("${emoji.name}，长按管理", "${emoji.name}, hold to manage") else emoji.name,
                                     contentScale = ContentScale.Fit,
                                     modifier = Modifier.fillMaxSize().padding(4.dp),

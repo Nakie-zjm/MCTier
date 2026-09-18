@@ -1,23 +1,17 @@
-use futures_util::{stream, StreamExt};
+use flate2::read::GzDecoder;
 use serde::Serialize;
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc,
-};
-use std::time::Duration;
+use std::io::Read;
+use std::path::Path;
+use tauri::path::BaseDirectory;
 use tauri::{Emitter, Manager};
-use tokio::io::AsyncReadExt;
 
-const SOURCE_PAGE: &str =
-    "https://www.emojiall.com/zh-hans/image-emoji-platform/telegram/animation";
-const ASSET_ROOT: &str = "https://www.emojiall.com/images/120/telegram";
-const MAX_PAGE_BYTES: usize = 2 * 1024 * 1024;
-const MAX_GIF_BYTES: usize = 4 * 1024 * 1024;
+const MAGIC: &[u8] = b"MCTIER_EMOJI_PACK_V3\0";
 const MAX_EMOJI_COUNT: usize = 2_000;
 const MIN_EMOJI_COUNT: usize = 100;
-const DOWNLOAD_CONCURRENCY: usize = 10;
+const MAX_GIF_BYTES: usize = 4 * 1024 * 1024;
+const MAX_TOTAL_BYTES: usize = 512 * 1024 * 1024;
+const MAX_ID_BYTES: usize = 128;
 static SYNC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[derive(Clone, Serialize)]
@@ -36,239 +30,116 @@ struct BuiltinEmojiProgress {
 }
 
 fn emit_progress(app: &tauri::AppHandle, downloaded: usize, total: usize) {
-    let _ = app.emit(
-        "builtin-emoji-progress",
-        BuiltinEmojiProgress { downloaded, total },
-    );
+    let _ = app.emit("builtin-emoji-progress", BuiltinEmojiProgress { downloaded, total });
 }
 
-async fn read_limited(response: reqwest::Response, limit: usize) -> Result<Vec<u8>, String> {
-    if response
-        .content_length()
-        .is_some_and(|length| length > limit as u64)
-    {
-        return Err("远程表情资源超过大小限制".into());
-    }
-    let mut output = Vec::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| format!("读取表情资源失败: {error}"))?;
-        let Some(next_length) = output.len().checked_add(chunk.len()) else {
-            return Err("远程表情资源超过大小限制".into());
-        };
-        if next_length > limit {
-            return Err("远程表情资源超过大小限制".into());
-        }
-        output.extend_from_slice(&chunk);
-    }
-    Ok(output)
+fn valid_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= MAX_ID_BYTES && id.chars().all(|character| {
+        character.is_ascii_alphanumeric() || character == '_' || character == '-'
+    })
 }
 
-fn parse_ids(html: &str) -> Result<Vec<String>, String> {
-    let pattern = regex::Regex::new(r#"/images/120/telegram/([A-Za-z0-9_-]+)\.gif"#)
-        .map_err(|error| error.to_string())?;
-    let mut ids = Vec::new();
-    for capture in pattern.captures_iter(html) {
-        let id = capture[1].to_string();
-        if !ids.contains(&id) {
-            ids.push(id);
-        }
-        if ids.len() > MAX_EMOJI_COUNT {
-            return Err("远程表情数量异常".into());
-        }
-    }
-    if ids.len() < MIN_EMOJI_COUNT {
-        return Err("未能从页面解析出完整表情列表".into());
-    }
-    Ok(ids)
+fn valid_gif(bytes: &[u8]) -> bool {
+    bytes.len() >= 6 && (&bytes[..6] == b"GIF87a" || &bytes[..6] == b"GIF89a")
 }
 
-fn assets(cache_dir: &Path, ids: &[String]) -> Vec<BuiltinEmojiAsset> {
-    ids.iter()
-        .map(|id| BuiltinEmojiAsset {
-            id: format!("builtin-{id}"),
-            name: id.clone(),
-            path: cache_dir
-                .join(format!("{id}.gif"))
-                .to_string_lossy()
-                .into_owned(),
-        })
-        .collect()
-}
-
-async fn valid_cached_gif(path: &Path) -> bool {
-    let Ok(metadata) = tokio::fs::metadata(path).await else {
-        return false;
-    };
-    if !metadata.is_file() || metadata.len() < 6 || metadata.len() > MAX_GIF_BYTES as u64 {
-        return false;
-    }
-    let Ok(mut file) = tokio::fs::File::open(path).await else {
-        return false;
-    };
+fn valid_cached_gif(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else { return false; };
+    if !metadata.is_file() || metadata.len() < 6 || metadata.len() > MAX_GIF_BYTES as u64 { return false; }
+    let Ok(mut file) = std::fs::File::open(path) else { return false; };
     let mut header = [0u8; 6];
-    file.read_exact(&mut header).await.is_ok() && (&header == b"GIF87a" || &header == b"GIF89a")
+    file.read_exact(&mut header).is_ok() && valid_gif(&header)
 }
 
-async fn cached_index(path: &Path) -> Option<Vec<String>> {
-    if tokio::fs::metadata(path).await.ok()?.len() > 128 * 1024 {
-        return None;
-    }
-    let index = tokio::fs::read_to_string(path).await.ok()?;
-    let ids = index
-        .lines()
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    if ids.len() < MIN_EMOJI_COUNT || ids.len() > MAX_EMOJI_COUNT {
-        return None;
-    }
-    let mut unique_ids = HashSet::with_capacity(ids.len());
-    for id in &ids {
-        if !unique_ids.insert(id)
-            || !id.chars().all(|character| {
-                character.is_ascii_alphanumeric() || character == '_' || character == '-'
-            })
-        {
-            return None;
-        }
-    }
+fn read_index(path: &Path) -> Option<Vec<String>> {
+    let metadata = std::fs::metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > 128 * 1024 { return None; }
+    let text = std::fs::read_to_string(path).ok()?;
+    let ids = text.lines().filter(|line| !line.is_empty()).map(str::to_owned).collect::<Vec<_>>();
+    if ids.len() < MIN_EMOJI_COUNT || ids.len() > MAX_EMOJI_COUNT { return None; }
+    let mut unique = HashSet::with_capacity(ids.len());
+    if ids.iter().any(|id| !valid_id(id) || !unique.insert(id.clone())) { return None; }
     Some(ids)
 }
 
-async fn completed_cache(cache_dir: &Path) -> Option<Vec<BuiltinEmojiAsset>> {
-    let ids = cached_index(&cache_dir.join("complete-v1.txt")).await?;
-    for id in &ids {
-        let path = cache_dir.join(format!("{id}.gif"));
-        if !valid_cached_gif(&path).await {
-            return None;
-        }
-    }
-    Some(assets(cache_dir, &ids))
+fn assets(cache_dir: &Path, ids: &[String]) -> Vec<BuiltinEmojiAsset> {
+    ids.iter().map(|id| BuiltinEmojiAsset {
+        id: format!("builtin-{id}"), name: id.clone(),
+        path: cache_dir.join(format!("{id}.gif")).to_string_lossy().into_owned(),
+    }).collect()
 }
 
-async fn complete_download_batch<F: std::future::Future<Output = Result<(), String>>>(
-    tasks: impl IntoIterator<Item = F>,
-) -> Result<(), String> {
-    let results = stream::iter(tasks)
-        .buffer_unordered(DOWNLOAD_CONCURRENCY)
-        .collect::<Vec<_>>()
-        .await;
-    // A failed resource must not cancel the other downloads or discard their cache.
-    results.into_iter().collect()
+fn completed_cache(cache_dir: &Path) -> Option<Vec<BuiltinEmojiAsset>> {
+    let ids = read_index(&cache_dir.join("complete-v3.txt"))?;
+    ids.iter().all(|id| valid_cached_gif(&cache_dir.join(format!("{id}.gif")))).then(|| assets(cache_dir, &ids))
 }
 
-async fn download_one(
-    client: reqwest::Client,
-    cache_dir: PathBuf,
-    id: String,
-) -> Result<(), String> {
-    let destination = cache_dir.join(format!("{id}.gif"));
-    if valid_cached_gif(&destination).await {
-        return Ok(());
+fn read_u16(input: &mut impl Read) -> Result<u16, String> {
+    let mut bytes = [0; 2];
+    input.read_exact(&mut bytes).map_err(|_| "内置表情资源包已损坏".to_string())?;
+    Ok(u16::from_le_bytes(bytes))
+}
+
+fn read_u32(input: &mut impl Read) -> Result<u32, String> {
+    let mut bytes = [0; 4];
+    input.read_exact(&mut bytes).map_err(|_| "内置表情资源包已损坏".to_string())?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn replace_file(source: &Path, destination: &Path) -> Result<(), String> {
+    if std::fs::rename(source, destination).is_ok() { return Ok(()); }
+    let _ = std::fs::remove_file(destination);
+    std::fs::rename(source, destination).map_err(|error| format!("提交内置表情缓存失败: {error}"))
+}
+
+fn unpack_to_cache(pack_path: &Path, cache_dir: &Path, progress: impl Fn(usize, usize)) -> Result<Vec<String>, String> {
+    let pack = std::fs::File::open(pack_path).map_err(|error| format!("无法打开内置表情资源包: {error}"))?;
+    let mut input = GzDecoder::new(std::io::BufReader::new(pack));
+    let mut magic = vec![0; MAGIC.len()];
+    input.read_exact(&mut magic).map_err(|_| "内置表情资源包已损坏".to_string())?;
+    if magic != MAGIC { return Err("内置表情资源包版本不兼容".into()); }
+    let count = read_u32(&mut input)? as usize;
+    if !(MIN_EMOJI_COUNT..=MAX_EMOJI_COUNT).contains(&count) { return Err("内置表情数量异常".into()); }
+    let mut ids = Vec::with_capacity(count);
+    let mut total_bytes = 0usize;
+    for index in 0..count {
+        let id_len = read_u16(&mut input)? as usize;
+        let gif_len = read_u32(&mut input)? as usize;
+        if id_len == 0 || id_len > MAX_ID_BYTES || gif_len < 6 || gif_len > MAX_GIF_BYTES { return Err("内置表情资源包条目超出限制".into()); }
+        total_bytes = total_bytes.checked_add(gif_len).filter(|size| *size <= MAX_TOTAL_BYTES).ok_or_else(|| "内置表情解压后体积超过限制".to_string())?;
+        let mut id_bytes = vec![0; id_len];
+        input.read_exact(&mut id_bytes).map_err(|_| "内置表情资源包已损坏".to_string())?;
+        let id = String::from_utf8(id_bytes).map_err(|_| "内置表情 ID 无效".to_string())?;
+        if !valid_id(&id) || ids.iter().any(|existing| existing == &id) { return Err("内置表情 ID 无效或重复".into()); }
+        let mut gif = vec![0; gif_len];
+        input.read_exact(&mut gif).map_err(|_| "内置表情资源包已损坏".to_string())?;
+        if !valid_gif(&gif) { return Err("内置表情资源包包含无效 GIF".into()); }
+        let temporary = cache_dir.join(format!("{id}.part"));
+        std::fs::write(&temporary, gif).map_err(|error| format!("写入内置表情失败: {error}"))?;
+        replace_file(&temporary, &cache_dir.join(format!("{id}.gif")))?;
+        ids.push(id);
+        progress(index + 1, count);
     }
-    let url = format!("{ASSET_ROOT}/{id}.gif");
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|error| format!("下载表情失败: {error}"))?;
-    if !response.status().is_success() {
-        return Err(format!("下载表情失败: HTTP {}", response.status()));
-    }
-    let bytes = read_limited(response, MAX_GIF_BYTES).await?;
-    if !(bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")) {
-        return Err("远程资源不是有效 GIF".into());
-    }
-    let temporary = cache_dir.join(format!("{id}.tmp"));
-    tokio::fs::write(&temporary, bytes)
-        .await
-        .map_err(|error| format!("写入表情缓存失败: {error}"))?;
-    if tokio::fs::rename(&temporary, &destination).await.is_err() {
-        let _ = tokio::fs::remove_file(&destination).await;
-        tokio::fs::rename(&temporary, &destination)
-            .await
-            .map_err(|error| format!("提交表情缓存失败: {error}"))?;
-    }
-    Ok(())
+    let mut trailing = [0u8; 1];
+    if input.read(&mut trailing).map_err(|error| format!("读取内置表情资源失败: {error}"))? != 0 { return Err("内置表情资源包包含多余数据".into()); }
+    let temporary_marker = cache_dir.join("complete-v3.tmp");
+    std::fs::write(&temporary_marker, ids.join("\n")).map_err(|error| format!("写入内置表情索引失败: {error}"))?;
+    replace_file(&temporary_marker, &cache_dir.join("complete-v3.txt"))?;
+    Ok(ids)
 }
 
 #[tauri::command]
 pub async fn sync_builtin_emoji(app: tauri::AppHandle) -> Result<Vec<BuiltinEmojiAsset>, String> {
     let _guard = SYNC_LOCK.lock().await;
-    let cache_dir = app
-        .path()
-        .app_cache_dir()
-        .map_err(|error| format!("无法定位应用缓存目录: {error}"))?
-        .join("emoji-builtin-v1");
-    tokio::fs::create_dir_all(&cache_dir)
-        .await
-        .map_err(|error| format!("无法创建表情缓存目录: {error}"))?;
-    if let Some(cached) = completed_cache(&cache_dir).await {
-        emit_progress(&app, cached.len(), cached.len());
-        return Ok(cached);
-    }
-
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(12))
-        .timeout(Duration::from_secs(35))
-        .redirect(reqwest::redirect::Policy::none())
-        .user_agent("MCTier/3.4 emoji-cache")
-        .build()
-        .map_err(|error| format!("无法创建表情下载客户端: {error}"))?;
-    let ids = if let Some(ids) = cached_index(&cache_dir.join("index-v1.txt")).await {
-        ids
-    } else {
-        let response = client
-            .get(SOURCE_PAGE)
-            .send()
-            .await
-            .map_err(|error| format!("获取表情页面失败: {error}"))?;
-        if !response.status().is_success() {
-            return Err(format!("获取表情页面失败: HTTP {}", response.status()));
-        }
-        let html = String::from_utf8(read_limited(response, MAX_PAGE_BYTES).await?)
-            .map_err(|_| "表情页面编码无效".to_string())?;
-        let ids = parse_ids(&html)?;
-        tokio::fs::write(cache_dir.join("index-v1.txt"), ids.join("\n"))
-            .await
-            .map_err(|error| format!("保存表情下载索引失败: {error}"))?;
-        ids
-    };
-    let total = ids.len();
-    let mut pending = Vec::new();
-    for id in &ids {
-        if !valid_cached_gif(&cache_dir.join(format!("{id}.gif"))).await {
-            pending.push(id.clone());
-        }
-    }
-    let completed = Arc::new(AtomicUsize::new(total - pending.len()));
-    emit_progress(&app, completed.load(Ordering::Relaxed), total);
-
-    complete_download_batch(pending.into_iter().map(|id| {
-        let app = app.clone();
-        let client = client.clone();
-        let cache_dir = cache_dir.clone();
-        let completed = Arc::clone(&completed);
-        async move {
-            download_one(client, cache_dir, id).await?;
-            let downloaded = completed.fetch_add(1, Ordering::Relaxed) + 1;
-            emit_progress(&app, downloaded, total);
-            Ok::<(), String>(())
-        }
-    }))
-    .await?;
-    let marker = cache_dir.join("complete-v1.txt");
-    let temporary_marker = cache_dir.join("complete-v1.tmp");
-    tokio::fs::write(&temporary_marker, ids.join("\n"))
-        .await
-        .map_err(|error| format!("写入表情缓存索引失败: {error}"))?;
-    if tokio::fs::rename(&temporary_marker, &marker).await.is_err() {
-        let _ = tokio::fs::remove_file(&marker).await;
-        tokio::fs::rename(&temporary_marker, &marker)
-            .await
-            .map_err(|error| format!("提交表情缓存索引失败: {error}"))?;
-    }
+    let cache_dir = app.path().app_cache_dir().map_err(|error| format!("无法定位应用缓存目录: {error}"))?.join("emoji-builtin-v3");
+    std::fs::create_dir_all(&cache_dir).map_err(|error| format!("无法创建表情缓存目录: {error}"))?;
+    if let Some(cached) = completed_cache(&cache_dir) { emit_progress(&app, cached.len(), cached.len()); return Ok(cached); }
+    let pack_path = app.path().resolve("builtin-emoji/builtin-v3.pack.gz", BaseDirectory::Resource)
+        .map_err(|error| format!("无法定位内置表情资源包: {error}"))?;
+    let app_for_progress = app.clone();
+    let cache_for_unpack = cache_dir.clone();
+    let ids = tokio::task::spawn_blocking(move || unpack_to_cache(&pack_path, &cache_for_unpack, |done, total| emit_progress(&app_for_progress, done, total)))
+        .await.map_err(|error| format!("解压内置表情任务失败: {error}"))??;
     Ok(assets(&cache_dir, &ids))
 }
 
@@ -276,83 +147,23 @@ pub async fn sync_builtin_emoji(app: tauri::AppHandle) -> Result<Vec<BuiltinEmoj
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn ten_downloads_run_in_parallel_and_one_failure_does_not_cancel_the_batch() {
-        let active = AtomicUsize::new(0);
-        let peak = AtomicUsize::new(0);
-        let finished = AtomicUsize::new(0);
-        let result = complete_download_batch((0..25).map(|index| {
-            let (active, peak, finished) = (&active, &peak, &finished);
-            async move {
-                let count = active.fetch_add(1, Ordering::SeqCst) + 1;
-                peak.fetch_max(count, Ordering::SeqCst);
-                tokio::time::sleep(Duration::from_millis(10)).await;
-                active.fetch_sub(1, Ordering::SeqCst);
-                finished.fetch_add(1, Ordering::SeqCst);
-                if index == 0 {
-                    Err("temporary failure".into())
-                } else {
-                    Ok(())
-                }
-            }
-        }))
-        .await;
-        assert!(result.is_err());
-        assert_eq!(peak.load(Ordering::SeqCst), 10);
-        assert_eq!(finished.load(Ordering::SeqCst), 25);
+    #[test]
+    fn validates_ids_and_gif_headers() {
+        assert!(valid_id("1f600")); assert!(valid_id("263a-fe0f")); assert!(!valid_id("../secret"));
+        assert!(valid_gif(b"GIF89a")); assert!(valid_gif(b"GIF87a")); assert!(!valid_gif(b"<html>"));
     }
 
     #[test]
-    fn parser_extracts_safe_ids_and_deduplicates_them() {
-        let mut html = String::new();
-        for index in 0..MIN_EMOJI_COUNT {
-            html.push_str(&format!(
-                r#"<img src="/images/120/telegram/{index:x}.gif">"#
-            ));
-        }
-        html.push_str(
-            r#"<img src="/images/120/telegram/0.gif"><img src="/images/120/other/no.gif">"#,
-        );
-        let ids = parse_ids(&html).unwrap();
-        assert_eq!(ids.len(), MIN_EMOJI_COUNT);
-    }
-
-    #[tokio::test]
-    async fn completed_cache_requires_every_indexed_file_to_be_a_gif() {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let cache_dir = std::env::temp_dir().join(format!(
-            "mctier-builtin-emoji-{}-{unique}",
-            std::process::id()
-        ));
-        tokio::fs::create_dir_all(&cache_dir).await.unwrap();
-        let ids = (0..MIN_EMOJI_COUNT)
-            .map(|index| format!("{index:x}"))
-            .collect::<Vec<_>>();
-        for id in &ids {
-            tokio::fs::write(cache_dir.join(format!("{id}.gif")), b"GIF89a")
-                .await
-                .unwrap();
-        }
-        tokio::fs::write(cache_dir.join("complete-v1.txt"), ids.join("\n"))
-            .await
-            .unwrap();
-
-        tokio::fs::write(cache_dir.join("index-v1.txt"), ids.join("\n"))
-            .await
-            .unwrap();
-        assert_eq!(
-            cached_index(&cache_dir.join("index-v1.txt")).await.unwrap(),
-            ids
-        );
-
-        assert_eq!(completed_cache(&cache_dir).await.unwrap().len(), ids.len());
-        tokio::fs::write(cache_dir.join("0.gif"), b"<html>")
-            .await
-            .unwrap();
-        assert!(completed_cache(&cache_dir).await.is_none());
-        tokio::fs::remove_dir_all(cache_dir).await.unwrap();
+    fn completed_cache_rejects_invalid_files() {
+        let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let directory = std::env::temp_dir().join(format!("mctier-emoji-{unique}"));
+        std::fs::create_dir_all(&directory).unwrap();
+        let ids = (0..MIN_EMOJI_COUNT).map(|index| format!("{index:x}")).collect::<Vec<_>>();
+        for id in &ids { std::fs::write(directory.join(format!("{id}.gif")), b"GIF89a").unwrap(); }
+        std::fs::write(directory.join("complete-v3.txt"), ids.join("\n")).unwrap();
+        assert_eq!(completed_cache(&directory).unwrap().len(), MIN_EMOJI_COUNT);
+        std::fs::write(directory.join("0.gif"), b"broken").unwrap();
+        assert!(completed_cache(&directory).is_none());
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }
