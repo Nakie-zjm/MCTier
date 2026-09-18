@@ -22,6 +22,10 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import top.pmh13.mctier.network.LobbyAddress
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -321,6 +325,7 @@ class MctierRepository(private val context: Context) {
     @Volatile
     private var lobbyLifecycleGeneration = 0L
     private var lobbyLifecycleJob: Job? = null
+    private val lobbyLifecycleMutex = Mutex()
     @Volatile
     private var serverSessionGeneration: Long? = null
 
@@ -588,6 +593,7 @@ class MctierRepository(private val context: Context) {
         password: String,
         nodeOverride: String? = null,
         signalingOverride: String? = null,
+        addressAttempt: Int = 0,
     ) {
         val safeLobbyName = lobbyName.trim()
         val safePassword = LobbyInviteCodec.resolveLobbyPassword(password)?.trim()
@@ -612,158 +618,194 @@ class MctierRepository(private val context: Context) {
             return
         }
         lobbyLifecycleJob = scope.launch {
-            if (!isCurrentLobbyGeneration(generation)) return@launch
-            _state.update { it.copy(state = AppConnectionState.Connecting, error = null, playerId = identityId) }
-            runCatching {
-                val session = networkController.startEasyTier(
-                    safeLobbyName, safePassword, settings.playerName, effectiveNode,
-                    mtu = settings.mtu.takeIf { it in 500..1500 } ?: 1420,
-                    latencyFirst = settings.latencyFirst,
-                    proxyCidrs = settings.proxyCidrs.split('\n', ',').map { it.trim() }.filter { it.isNotBlank() },
-                    exitNodes = if (settings.enableExitNode) settings.exitNodes.split('\n', ',').map { it.trim() }.filter { it.isNotBlank() } else emptyList(),
-                    asExitNode = settings.enableAsExitNode,
-                    multiThread = settings.multiThread,
-                    useSmoltcp = settings.useSmoltcp,
-                    enableKcpProxy = settings.enableKcpProxy,
-                    enableQuicProxy = settings.enableQuicProxy,
-                    disableP2p = settings.disableP2p,
-                    disableUdpHolePunching = settings.disableUdpHolePunching,
-                    relayAllPeerRpc = settings.relayAllPeerRpc,
-                    compressionZstd = settings.compressionZstd,
-                    privateMode = settings.privateMode,
-                    // Android uses virtual IPs only; Magic DNS is desktop-only.
-                    useDomain = false,
-                )
-                if (!isCurrentLobbyGeneration(generation)) return@runCatching
-                val lobby = Lobby(
-                    id = "",
-                    name = safeLobbyName,
-                    password = safePassword,
-                    createdAt = System.currentTimeMillis(),
-                    virtualIp = session.virtualIp,
-                    virtualDomain = ChatAuth.virtualDomainForIdentityId(identityId),
-                    useDomain = false,
-                    signalingServer = effectiveSignaling,
-                    serverNode = effectiveNode,
-                )
-                fileServer = FileShareHttpServer(context, identityId, session.virtualIp).also { it.start(5_000, false) }
-                // 启动 P2P 聊天（与桌面端 14540 互通）
-                chatClient = ChatP2PClient(identityId, ioScope, session.virtualIp, { wire -> onIncomingChat(wire) }, java.io.File(context.cacheDir, "chat-attachments"), signer)
-                screenController = ScreenShareController(appContext, identityId) { signalingClient.send(it) }.also { controller ->
-                    val callbackGeneration = generation
-                    controller.onViewingError = { shareId, error ->
-                        if (isCurrentLobbyGeneration(callbackGeneration)) {
-                            _state.update { state ->
-                                if (state.viewingShareId == shareId) state.copy(viewingShareId = null, error = error) else state
+            lobbyLifecycleMutex.withLock {
+                if (!isCurrentLobbyGeneration(generation)) return@launch
+                stopLobbyResources()
+                if (!isCurrentLobbyGeneration(generation)) return@launch
+                _state.update { it.copy(state = AppConnectionState.Connecting, error = null, playerId = identityId) }
+                runCatching {
+                    LobbyAddress.recover(addressAttempt) { attempt ->
+                        var accepted = false
+                        try {
+                            val session = networkController.startEasyTier(
+                                safeLobbyName, safePassword, settings.playerName, effectiveNode,
+                                mtu = settings.mtu.takeIf { it in 500..1500 } ?: 1420,
+                                latencyFirst = settings.latencyFirst,
+                                proxyCidrs = settings.proxyCidrs.split('\n', ',').map { it.trim() }.filter { it.isNotBlank() },
+                                exitNodes = if (settings.enableExitNode) settings.exitNodes.split('\n', ',').map { it.trim() }.filter { it.isNotBlank() } else emptyList(),
+                                asExitNode = settings.enableAsExitNode,
+                                multiThread = settings.multiThread,
+                                useSmoltcp = settings.useSmoltcp,
+                                enableKcpProxy = settings.enableKcpProxy,
+                                enableQuicProxy = settings.enableQuicProxy,
+                                disableP2p = settings.disableP2p,
+                                disableUdpHolePunching = settings.disableUdpHolePunching,
+                                relayAllPeerRpc = settings.relayAllPeerRpc,
+                                compressionZstd = settings.compressionZstd,
+                                privateMode = settings.privateMode,
+                                // Android uses virtual IPs only; Magic DNS is desktop-only.
+                                useDomain = false,
+                                identityId = identityId,
+                                addressAttempt = attempt,
+                            )
+                            if (!isCurrentLobbyGeneration(generation)) throw CancellationException("Lobby session superseded")
+                            val lobby = Lobby(
+                                id = "",
+                                name = safeLobbyName,
+                                password = safePassword,
+                                createdAt = System.currentTimeMillis(),
+                                virtualIp = session.virtualIp,
+                                virtualDomain = ChatAuth.virtualDomainForIdentityId(identityId),
+                                useDomain = false,
+                                signalingServer = effectiveSignaling,
+                                serverNode = effectiveNode,
+                                addressAttempt = attempt,
+                            )
+                            fileServer = FileShareHttpServer(context, identityId, session.virtualIp).also { it.start(5_000, false) }
+                            // 启动 P2P 聊天（与桌面端 14540 互通）
+                            chatClient = ChatP2PClient(identityId, ioScope, session.virtualIp, { wire -> onIncomingChat(wire) }, java.io.File(context.cacheDir, "chat-attachments"), signer)
+                            screenController = ScreenShareController(appContext, identityId) { signalingClient.send(it) }.also { controller ->
+                                val callbackGeneration = generation
+                                controller.onViewingError = { shareId, error ->
+                                    if (isCurrentLobbyGeneration(callbackGeneration)) {
+                                        _state.update { state ->
+                                            if (state.viewingShareId == shareId) state.copy(viewingShareId = null, error = error) else state
+                                        }
+                                    }
+                                }
+                                controller.onViewerCountChanged = { shareId, count ->
+                                    if (isCurrentLobbyGeneration(callbackGeneration)) {
+                                        _state.update { state ->
+                                            state.copy(screenShares = state.screenShares.map { share ->
+                                                if (share.id == shareId) share.copy(viewerCount = count) else share
+                                            })
+                                        }
+                                    }
+                                }
+                                controller.onCaptureStopped = { shareId ->
+                                    if (isCurrentLobbyGeneration(callbackGeneration)) {
+                                        scope.launch { handleLocalCaptureStopped(shareId) }
+                                    }
+                                }
+                                controller.onCaptureVisibilityChanged = { _, isVisible ->
+                                    if (isCurrentLobbyGeneration(callbackGeneration)) {
+                                        _state.update { it.copy(capturedContentVisible = isVisible) }
+                                    }
+                                }
                             }
-                        }
-                    }
-                    controller.onViewerCountChanged = { shareId, count ->
-                        if (isCurrentLobbyGeneration(callbackGeneration)) {
-                            _state.update { state ->
-                                state.copy(screenShares = state.screenShares.map { share ->
-                                    if (share.id == shareId) share.copy(viewerCount = count) else share
-                                })
+                            remoteControlController = top.pmh13.mctier.network.RemoteControlController(appContext, identityId) { signalingClient.send(it) }.also { rc ->
+                                val callbackGeneration = generation
+                                rc.onRequest = { sid, fromId, fromName ->
+                                    if (isCurrentLobbyGeneration(callbackGeneration)) {
+                                        invalidatePendingRemoteControlAccept()
+                                        _state.update { it.copy(remoteControlRequest = top.pmh13.mctier.data.RemoteControlRequest(sid, fromId, fromName)) }
+                                    }
+                                }
+                                rc.onActive = { name ->
+                                    if (isCurrentLobbyGeneration(callbackGeneration)) {
+                                        _state.update { it.copy(remoteControlActiveBy = name, remoteControlRequest = null) }
+                                    }
+                                }
+                                rc.onEnded = {
+                                    if (isCurrentLobbyGeneration(callbackGeneration)) {
+                                        invalidatePendingRemoteControlAccept()
+                                        _state.update { it.copy(remoteControlActiveBy = null, remoteControlRequest = null, remoteControllingPeer = null) }
+                                    }
+                                }
+                                rc.onControllerActive = { name ->
+                                    if (isCurrentLobbyGeneration(callbackGeneration)) {
+                                        _state.update { it.copy(remoteControllingPeer = name) }
+                                    }
+                                }
+                                rc.onRejected = { reason ->
+                                    if (isCurrentLobbyGeneration(callbackGeneration)) {
+                                        _state.update { it.copy(remoteControllingPeer = null) }
+                                    }
+                                }
                             }
+                            rtcController.initialize(identityId) { signalingClient.send(it) }
+                            // 仅在确实持有 RECORD_AUDIO 时启动麦克风前台服务。用户拒绝权限后仍可先加入大厅，
+                            // 稍后通过大厅里的“重新申请麦克风权限”入口恢复语音。
+                            if (androidx.core.content.ContextCompat.checkSelfPermission(
+                                    appContext,
+                                    android.Manifest.permission.RECORD_AUDIO,
+                                ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+                            ) {
+                                top.pmh13.mctier.service.VoiceForegroundService.start(appContext)
+                            }
+                            // 聊天签名公钥必须在注册时就带上：信令会把它绑定到本连接的 playerId
+                            // 再分发给其他成员，成员因此无法替他人发布公钥。
+                            val chatPublicKey = chatClient?.ensureSigningKey()
+                            if (chatPublicKey == null) {
+                                error(L("无法生成聊天签名密钥", "Unable to generate chat signing key"))
+                            }
+                            val activeSigner = chatClient?.signingSigner() ?: error("Chat signer unavailable")
+                            if (!isCurrentLobbyGeneration(generation)) throw CancellationException("Lobby session superseded")
+                            serverSessionGeneration = null
+                            // Publish the local lobby before asynchronous registration callbacks.
+                            _state.update { it.copy(playerId = identityId, lobby = lobby, chatReady = false, chatConnectionError = null,
+                                players = listOf(Player(id = identityId, name = settings.playerName, avatarData = it.settings.avatarData,
+                                    virtualIp = lobby.virtualIp, virtualDomain = lobby.virtualDomain, useDomain = lobby.useDomain))) }
+                            signalingClient.connectAndAwaitRegistration(
+                                ConnectArgs(
+                                    url = lobby.signalingServer,
+                                    identityId = identityId,
+                                    playerName = settings.playerName,
+                                    lobbyName = lobby.name,
+                                    lobbyPassword = lobby.password,
+                                    virtualIp = lobby.virtualIp,
+                                    signer = activeSigner,
+                                    useDomain = lobby.useDomain,
+                                ),
+                            )
+                            if (!isCurrentLobbyGeneration(generation)) throw CancellationException("Lobby session superseded")
+                            _state.update {
+                                it.copy(
+                                    playerId = identityId,
+                                    state = AppConnectionState.InLobby,
+                                    lobby = it.lobby ?: lobby,
+                                )
+                            }
+                            recordRecentLobby(lobby.name, lobby.password, effectiveNode, effectiveSignaling)
+                            statsStartSession()
+                            accepted = true
+                        } finally {
+                            if (!accepted) withContext(NonCancellable) { stopLobbyResources() }
                         }
                     }
-                    controller.onCaptureStopped = { shareId ->
-                        if (isCurrentLobbyGeneration(callbackGeneration)) {
-                            scope.launch { handleLocalCaptureStopped(shareId) }
-                        }
+                }.onFailure { e ->
+                    if (e !is CancellationException && isCurrentLobbyGeneration(generation)) {
+                        _state.update { it.copy(state = AppConnectionState.Error, lobby = null, players = emptyList(), chatReady = false, error = e.message ?: L("加入大厅失败", "Failed to join lobby")) }
                     }
-                    controller.onCaptureVisibilityChanged = { _, isVisible ->
-                        if (isCurrentLobbyGeneration(callbackGeneration)) {
-                            _state.update { it.copy(capturedContentVisible = isVisible) }
-                        }
-                    }
-                }
-                remoteControlController = top.pmh13.mctier.network.RemoteControlController(appContext, identityId) { signalingClient.send(it) }.also { rc ->
-                    val callbackGeneration = generation
-                    rc.onRequest = { sid, fromId, fromName ->
-                        if (isCurrentLobbyGeneration(callbackGeneration)) {
-                            invalidatePendingRemoteControlAccept()
-                            _state.update { it.copy(remoteControlRequest = top.pmh13.mctier.data.RemoteControlRequest(sid, fromId, fromName)) }
-                        }
-                    }
-                    rc.onActive = { name ->
-                        if (isCurrentLobbyGeneration(callbackGeneration)) {
-                            _state.update { it.copy(remoteControlActiveBy = name, remoteControlRequest = null) }
-                        }
-                    }
-                    rc.onEnded = {
-                        if (isCurrentLobbyGeneration(callbackGeneration)) {
-                            invalidatePendingRemoteControlAccept()
-                            _state.update { it.copy(remoteControlActiveBy = null, remoteControlRequest = null, remoteControllingPeer = null) }
-                        }
-                    }
-                    rc.onControllerActive = { name ->
-                        if (isCurrentLobbyGeneration(callbackGeneration)) {
-                            _state.update { it.copy(remoteControllingPeer = name) }
-                        }
-                    }
-                    rc.onRejected = { reason ->
-                        if (isCurrentLobbyGeneration(callbackGeneration)) {
-                            _state.update { it.copy(remoteControllingPeer = null) }
-                        }
-                    }
-                }
-                rtcController.initialize(identityId) { signalingClient.send(it) }
-                // 仅在确实持有 RECORD_AUDIO 时启动麦克风前台服务。用户拒绝权限后仍可先加入大厅，
-                // 稍后通过大厅里的“重新申请麦克风权限”入口恢复语音。
-                if (androidx.core.content.ContextCompat.checkSelfPermission(
-                        appContext,
-                        android.Manifest.permission.RECORD_AUDIO,
-                    ) == android.content.pm.PackageManager.PERMISSION_GRANTED
-                ) {
-                    top.pmh13.mctier.service.VoiceForegroundService.start(appContext)
-                }
-                // 聊天签名公钥必须在注册时就带上：信令会把它绑定到本连接的 playerId
-                // 再分发给其他成员，成员因此无法替他人发布公钥。
-                val chatPublicKey = chatClient?.ensureSigningKey()
-                if (chatPublicKey == null) {
-                    rejectChatProtocol(L("无法生成聊天签名密钥", "Unable to generate chat signing key"))
-                    return@launch
-                }
-                val activeSigner = chatClient?.signingSigner() ?: return@runCatching
-                if (!isCurrentLobbyGeneration(generation)) return@runCatching
-                serverSessionGeneration = null
-                // Publish the local lobby before asynchronous registration callbacks.
-                _state.update { it.copy(playerId = identityId, lobby = lobby, chatReady = false, chatConnectionError = null,
-                    players = listOf(Player(id = identityId, name = settings.playerName, avatarData = it.settings.avatarData,
-                        virtualIp = lobby.virtualIp, virtualDomain = lobby.virtualDomain, useDomain = lobby.useDomain))) }
-                signalingClient.connect(
-                    ConnectArgs(
-                        url = lobby.signalingServer,
-                        identityId = identityId,
-                        playerName = settings.playerName,
-                        lobbyName = lobby.name,
-                        lobbyPassword = lobby.password,
-                        virtualIp = lobby.virtualIp,
-                        signer = activeSigner,
-                        useDomain = lobby.useDomain,
-                    ),
-                )
-                if (!isCurrentLobbyGeneration(generation)) return@runCatching
-                _state.update {
-                    it.copy(
-                        playerId = identityId,
-                        state = AppConnectionState.InLobby,
-                        lobby = it.lobby ?: lobby,
-                    )
-                }
-                recordRecentLobby(lobby.name, lobby.password, effectiveNode, effectiveSignaling)
-                statsStartSession()
-            }.onFailure { e ->
-                if (e !is CancellationException && isCurrentLobbyGeneration(generation)) {
-                    _state.update { it.copy(state = AppConnectionState.Error, error = e.message ?: L("加入大厅失败", "Failed to join lobby")) }
                 }
             }
         }
     }
 
+    // The lifecycle mutex keeps an old teardown from stopping a replacement VPN.
+    private suspend fun stopLobbyResources() {
+        chatClient?.let { runCatching { it.stop() } }
+        chatClient = null
+        chatLobbyId = null
+        chatToken = null
+        chatTokenEpoch = 0L
+        serverSessionGeneration = null
+        runCatching { signalingClient.close() }
+        runCatching { rtcController.cleanup() }
+        runCatching { top.pmh13.mctier.service.VoiceForegroundService.stop(appContext) }
+        runCatching { top.pmh13.mctier.ui.MicKeepAliveOverlay.hide() }
+        runCatching { screenController?.release() }
+        screenController = null
+        runCatching { remoteControlController?.release() }
+        remoteControlController = null
+        runCatching { ScreenCaptureService.stop(appContext) }
+        runCatching { fileServer?.stop() }
+        fileServer = null
+        runCatching { networkController.stopEasyTier() }
+    }
+
     fun leaveLobby() {
-        nextLobbyLifecycleGeneration()
+        val generation = nextLobbyLifecycleGeneration()
         lobbyLifecycleJob?.cancel()
         lobbyLifecycleJob = null
         val leaving = _state.value
@@ -807,18 +849,9 @@ class MctierRepository(private val context: Context) {
         }
         scope.launch {
             runCatching { statsEndSession(leaving.hostId == leaving.playerId) }
-            runCatching { signalingClient.close() }
-            runCatching { rtcController.cleanup() }
-            runCatching { top.pmh13.mctier.service.VoiceForegroundService.stop(appContext) }
-            runCatching { top.pmh13.mctier.ui.MicKeepAliveOverlay.hide() }
-            runCatching { screenController?.release() }
-            screenController = null
-            runCatching { remoteControlController?.release() }
-            remoteControlController = null
-            runCatching { ScreenCaptureService.stop(appContext) }
-            runCatching { fileServer?.stop() }
-            fileServer = null
-            runCatching { networkController.stopEasyTier() }
+            lobbyLifecycleMutex.withLock {
+                if (isCurrentLobbyGeneration(generation)) stopLobbyResources()
+            }
         }
     }
 
@@ -1863,6 +1896,16 @@ class MctierRepository(private val context: Context) {
         // player-left 必须先由权威成员快照确认，避免旧信令连接的延迟事件拆掉已恢复的语音链路。
         if (message.type != "player-left") rtcController.handleSignal(message)
         when (message.type) {
+            "register-error" -> {
+                val detail = message.message ?: L("加入大厅失败", "Failed to join lobby")
+                val lobby = _state.value.lobby
+                if (detail == LobbyAddress.Conflict && lobby != null && lobby.addressAttempt < 253) {
+                    createOrJoinLobby(lobby.name, lobby.password, lobby.serverNode, lobby.signalingServer, lobby.addressAttempt + 1)
+                } else {
+                    leaveLobby()
+                    _state.update { it.copy(state = AppConnectionState.Error, error = detail) }
+                }
+            }
             "version-too-old" -> {
                 // 服务器判定客户端版本过低：拦截、退出大厅并要求强制更新
                 val alert = top.pmh13.mctier.data.VersionAlert(

@@ -226,7 +226,7 @@ export class WebRTCClient {
     isPublic?: boolean;
     mutedPlayers?: string[];
   }) => void;
-  private onSignalingStatusCallback?: (status: SignalingConnectionStatus) => void;
+  private onSignalingStatusCallback?: (status: SignalingConnectionStatus, error?: string) => void;
   private onHostChangedCallback?: (hostId: string) => void;
   private onMuteChangedCallback?: (playerId: string, muted: boolean) => void;
   private onLobbyOptionsChangedCallback?: (maxPlayers: number | null, isPublic: boolean) => void;
@@ -846,7 +846,7 @@ export class WebRTCClient {
 
       if (error instanceof RegistrationError && !error.retryable) {
         this.isIntentionalDisconnect = true;
-        this.onSignalingStatusCallback?.('failed');
+        this.onSignalingStatusCallback?.('failed', error.message);
         return;
       }
 
@@ -4349,7 +4349,7 @@ export class WebRTCClient {
   }
 
   // ==================== 房主/大厅管理 ====================
-  onSignalingStatus(callback: (status: SignalingConnectionStatus) => void): void {
+  onSignalingStatus(callback: (status: SignalingConnectionStatus, error?: string) => void): void {
     this.onSignalingStatusCallback = callback;
   }
 

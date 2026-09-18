@@ -43,13 +43,15 @@ class NetworkController(private val context: Context) {
         compressionZstd: Boolean = false,
         privateMode: Boolean = false,
         useDomain: Boolean = false,
+        identityId: String,
+        addressAttempt: Int = 0,
     ): NetworkSession {
         val networkName = "MCTier-$lobbyName"
         val instanceName = "mctier_${lobbyName.hashCode().absoluteValue}_${playerName.hashCode().absoluteValue}"
         val normalizedNode = normalizeNode(node)
         // 只连接用户当前选择的节点，确保节点选择和实际网络连接保持一致。
         val peerList = listOf(normalizedNode)
-        val virtualIp = allocateVirtualIp(lobbyName, playerName)
+        val virtualIp = LobbyAddress.candidate(lobbyName, identityId, addressAttempt)
         Log.i(TAG, "Starting EasyTier instance=$instanceName ip=$virtualIp peers=$peerList lobby=$lobbyName")
         if (!EasyTierJNI.available) {
             error("EasyTier native load failed: ${EasyTierJNI.loadErrorMessage ?: "unknown error"}")
@@ -95,6 +97,10 @@ class NetworkController(private val context: Context) {
         if (reportedIp.isNullOrBlank()) {
             stopEasyTier()
             error("EasyTier did not report a virtual IP")
+        }
+        if (reportedIp.substringBefore('/') != virtualIp) {
+            stopEasyTier()
+            error("EasyTier virtual IP does not match the VPN address")
         }
         return NetworkSession(networkName, password, normalizedNode, virtualIp)
     }
@@ -220,44 +226,8 @@ class NetworkController(private val context: Context) {
         }
     }
 
-    // 【互通关键修复】固定使用 EasyTier 默认 DHCP 网段 10.126.126.0/24。
-    // 桌面端使用 DHCP，创建者会拿到 10.126.126.1，其余桌面节点依次 .2/.3...
-    // 安卓端的 TUN 地址必须由 VpnService 在建立前写死，无法走 DHCP，
-    // 因此这里固定落到同一网段，确保手机与电脑虚拟 IP 互相可达（语音/聊天/屏幕共享/文件均依赖此点）。
-    // 不同大厅由 EasyTier 的 network-name/secret 隔离，复用同一网段不会串台。
-    private val FIXED_SUBNET_OCTET = 126
-
-    /**
-     * 每台设备稳定且唯一的标识：用户同意隐私政策后优先用 ANDROID_ID（不同手机不同值，重连后稳定），
-     * 未同意或取不到时回退到一次性持久化的随机 UUID（可通过卸载重置）。
-     * 用它派生虚拟 IP 主机位，避免"相同玩家名 → 相同虚拟 IP"导致手机↔手机互相不可达。
-     * 合规：ANDROID_ID 属设备标识符（个人信息），仅在用户已同意隐私政策后才采集。
-     */
-    private fun deviceKey(): String {
-        if (top.pmh13.mctier.ui.ConsentStore.isAgreed(context)) {
-            runCatching {
-                @Suppress("HardwareIds")
-                val aid = android.provider.Settings.Secure.getString(context.contentResolver, android.provider.Settings.Secure.ANDROID_ID)
-                if (!aid.isNullOrBlank() && aid != "9774d56d682e549c") return aid
-            }
-        }
-        val prefs = context.getSharedPreferences("mctier_device", Context.MODE_PRIVATE)
-        prefs.getString("device_key", null)?.let { return it }
-        val gen = java.util.UUID.randomUUID().toString()
-        prefs.edit().putString("device_key", gen).apply()
-        return gen
-    }
-
-    // 主机位：用每台设备唯一的 deviceKey 派生，取范围 [10, 249]（共 240 个），
-    // 避开桌面 DHCP 创建者占用的 .1 与低位顺序分配区，最大程度降低冲突概率。
-    private fun hostOctet(key: String): Int =
-        10 + (key.hashCode().absoluteValue % 240)
-
-    private fun allocateVirtualIp(lobbyName: String, playerName: String): String =
-        "10.126.$FIXED_SUBNET_OCTET.${hostOctet(deviceKey() + "|" + lobbyName)}"
-
-    private fun lobbyRoute(lobbyName: String): String =
-        "10.126.$FIXED_SUBNET_OCTET.0/24"
+    // All platforms use the same /24. The VPN and native instance must agree.
+    private fun lobbyRoute(lobbyName: String): String = "10.126.126.0/24"
 
     private fun extractVirtualIpv4(json: String, instanceName: String): String? {
         val instanceIndex = json.indexOf(instanceName)

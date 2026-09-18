@@ -754,8 +754,8 @@ export const LobbyForm: React.FC<LobbyFormProps> = ({ mode, onClose }) => {
   const pendingAutoConfig = useRef<any>(null);
   useEffect(() => {
     const autoConfig = (window as any).__autoLobbyConfig || pendingAutoConfig.current;
-    // 没有配置或不是创建模式就跳过
-    if (!autoConfig || mode !== 'create') return;
+    // 自动进入使用与手动加入相同的路径
+    if (!autoConfig || mode !== 'join') return;
     // 立即清除，防止重复触发
     delete (window as any).__autoLobbyConfig;
     pendingAutoConfig.current = autoConfig;

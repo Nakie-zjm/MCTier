@@ -20,8 +20,8 @@ android {
         testInstrumentationRunner = "top.pmh13.mctier.PeerUiInstrumentation"
         minSdk = 26
         targetSdk = 36
-        versionCode = 73
-        versionName = "3.4.0-android"
+        versionCode = 78
+        versionName = "3.5.0-android"
         ndk {
             // The bundled LocalVQE engine is currently built for the primary
             // Android ABI; unsupported ABIs retain the WebRTC hardware AEC/NS path.
@@ -113,7 +113,7 @@ val syncDebugUnitTestKotlinClasses by tasks.registering(Sync::class) {
 // this project, even though they are present in its reported classpath. Keep a
 // normal Gradle/JUnit runner as the authoritative JVM test task.
 val jvmSecurityHardeningTest by tasks.registering(JavaExec::class) {
-    dependsOn("compileDebugUnitTestKotlin")
+    dependsOn("compileDebugUnitTestKotlin", "bundleDebugClassesToRuntimeJar")
     classpath = files(
         layout.buildDirectory.dir("tmp/kotlin-classes/debugUnitTest"),
         layout.buildDirectory.dir("tmp/kotlin-classes/debug"),
@@ -126,6 +126,8 @@ val jvmSecurityHardeningTest by tasks.registering(JavaExec::class) {
         fileTree("${gradle.gradleUserHomeDir}/caches/modules-2/files-2.1/org.hamcrest/hamcrest-core") { include("**/*.jar") },
     )
     mainClass.set("org.junit.runner.JUnitCore")
+    args("top.pmh13.mctier.network.LobbyAddressTest")
+    args("top.pmh13.mctier.network.SignalingRegistrationTest")
     args("top.pmh13.mctier.ui.ChatMediaLayoutTest")
     args("top.pmh13.mctier.ui.ThemeContrastTest")
     args("top.pmh13.mctier.network.PeerPreferencesTest")

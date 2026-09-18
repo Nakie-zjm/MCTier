@@ -21,6 +21,9 @@ export interface Lobby {
   createdAt: string;
   /** 虚拟 IP 地址（当前玩家的） */
   virtualIp: string;
+  automaticVirtualIp?: boolean;
+  addressAttempt?: number;
+  addressRecoveryStartedAt?: number;
   /** 创建者的虚拟 IP 地址（用于连接 WebSocket 信令服务器） */
   creatorVirtualIp: string;
   /** 虚拟域名（如果配置了） */

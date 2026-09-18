@@ -17,7 +17,7 @@ test('Windows release export works through junctions and rejects incomplete or w
     const result = spawnSync('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
       fileURLToPath(new URL('./windows-release.test.ps1', import.meta.url)), '-FixtureDirectory', fixture], { encoding: 'utf8', env });
     assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
-    assert.equal((result.stdout.match(/PASS:/g) ?? []).length, 4);
+    assert.equal((result.stdout.match(/PASS:/g) ?? []).length, 7);
   } finally {
     // Remove the link itself before removing only this test's unique generated directory.
     const junction = path.join(fixture, 'target', 'release');

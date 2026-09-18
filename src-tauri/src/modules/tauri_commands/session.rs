@@ -70,6 +70,7 @@ pub async fn create_lobby(
     server_node: String,
     signaling_server: String,
     use_domain: Option<bool>,
+    address_attempt: Option<u16>,
     app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Lobby, String> {
@@ -136,6 +137,7 @@ pub async fn create_lobby(
             &app_handle,
             global_config,
             lobby_config,
+            address_attempt.unwrap_or(0),
         )
         .await
     {
@@ -257,6 +259,7 @@ pub async fn join_lobby(
     server_node: String,
     signaling_server: String,
     use_domain: Option<bool>,
+    address_attempt: Option<u16>,
     app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Lobby, String> {
@@ -322,6 +325,7 @@ pub async fn join_lobby(
             &app_handle,
             global_config,
             lobby_config,
+            address_attempt.unwrap_or(0),
         )
         .await
     {

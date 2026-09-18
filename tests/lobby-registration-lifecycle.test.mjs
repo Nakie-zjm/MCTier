@@ -3,6 +3,11 @@ import fs from 'node:fs';
 import vm from 'node:vm';
 import test from 'node:test';
 import ts from 'typescript';
+import { build } from 'esbuild';
+import { fileURLToPath } from 'node:url';
+
+const recoveryBundle = await build({ entryPoints: [fileURLToPath(new URL('../src/services/lobby/virtualAddressRecovery.ts', import.meta.url))], bundle: true, format: 'esm', write: false });
+const recovery = await import(`data:text/javascript,${encodeURIComponent(recoveryBundle.outputFiles[0].text)}`);
 
 const path = new URL('../src/App.tsx', import.meta.url);
 const source = ts.createSourceFile('App.tsx', fs.readFileSync(path, 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
@@ -76,3 +81,41 @@ test('a superseded registration failure does not stop the replacement network se
   assert.equal(current, false, 'the old initialization must reach its failure');
   assert.deepEqual(events, []);
 });
+
+for (const reconnect of [false, true]) {
+  test(`IP collision during ${reconnect ? 'reconnect' : 'startup'} stops the old session before restarting`, async () => {
+    const events = [];
+    const callbacks = {};
+    let finish;
+    const finished = new Promise(resolve => { finish = resolve; });
+    const lobby = { name: 'room', password: '', virtualIp: '10.126.126.1', automaticVirtualIp: true,
+      serverNode: 'udp://selected:11010', signalingServer: 'wss://selected' };
+    const store = { currentPlayerId: 'alice', config: { playerName: 'Alice' }, versionError: null,
+      setSignalingStatus() {}, setLobby(value) { events.push(['publish', value.virtualIp]); finish(value); } };
+    const conflict = 'virtualIp 已被大厅内其他成员使用';
+    vm.runInNewContext(compiled, {
+      ...recovery, appState: 'in-lobby', lobby,
+      lobbySessionCoordinator: { current: () => ({}), isCurrent: () => true, assertCurrent() {} },
+      useAppStore: { getState: () => store },
+      webrtcClient: new Proxy({}, { get: (_, name) => name === 'initialize'
+        ? async () => { if (!reconnect) throw new Error(conflict); callbacks.onSignalingStatus?.('connected'); }
+        : name === 'cleanup' ? async () => { events.push(['cleanup']); }
+        : callback => { callbacks[name] = callback; } }),
+      speakingDetector: { setCallback() {} },
+      fileShareService: { async startServer() { callbacks.onSignalingStatus('failed', conflict); } },
+      async invoke(command, args) {
+        events.push([command]);
+        if (command === 'join_lobby') {
+          assert.equal(args.addressAttempt, 1);
+          assert.equal(args.password, '');
+          assert.equal(args.serverNode, lobby.serverNode);
+          return { ...lobby, virtualIp: '10.126.126.2' };
+        }
+      },
+      console: { log() {}, error() {} }, Error, tl: text => text, sanitizeUntrustedText: text => text,
+    });
+    const replacement = await finished;
+    assert.deepEqual(events, [['cleanup'], ['leave_lobby'], ['join_lobby'], ['publish', '10.126.126.2']]);
+    assert.equal(replacement.addressAttempt, 1);
+  });
+}

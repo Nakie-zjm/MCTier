@@ -43,7 +43,7 @@ try {
     await page.waitForFunction(() => typeof window.resolveSettings === 'function');
     if (action !== 'auto') await page.getByRole('button', { name: action, exact: true }).click();
     await page.evaluate(() => window.resolveSettings());
-    const expected = action === 'Settings' ? 'settings' : action === 'lobby.join' ? 'join:manual' : action === 'auto' ? 'create:auto' : 'create:manual';
+    const expected = action === 'Settings' ? 'settings' : action === 'lobby.join' ? 'join:manual' : action === 'auto' ? 'join:auto' : 'create:manual';
     await page.waitForFunction(expected => document.querySelector('[role=status]')?.textContent === expected, expected);
     assert.equal(await page.evaluate(() => window.reads), 1, 'StrictMode must not duplicate startup reads');
     assert.equal(await page.evaluate(() => !!window.__autoLobbyConfig), action === 'auto');

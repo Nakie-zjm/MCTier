@@ -1006,7 +1006,7 @@ export const MiniWindow: React.FC = () => {
 
       // 4. 更新前端状态
       const { setLobby } = useAppStore.getState();
-      setLobby(newLobby);
+      setLobby({ ...newLobby, serverNode, signalingServer });
 
       // 5. 重新初始化WebRTC
       console.log('🔄 [MiniWindow] 正在重新初始化WebRTC...');

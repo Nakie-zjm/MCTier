@@ -28,6 +28,7 @@ import { versionCheckService } from './services/version/VersionCheckService';
 import { DOWNLOAD_WEBSITE } from './services/version/versionPolicy';
 import { parseLobbyInviteLink } from './services/lobby/lobbyInvite';
 import { lobbySessionCoordinator } from './services/lobby/LobbySessionCoordinator';
+import { recoverVirtualAddress, isVirtualIpConflict } from './services/lobby/virtualAddressRecovery';
 import type { UserConfig } from './types';
 import {
   THEME_CHANGED_EVENT,
@@ -504,6 +505,56 @@ function MainWindowApp() {
       const initWebRTC = async () => {
         const sessionTicket =
           lobbySessionCoordinator.current() ?? lobbySessionCoordinator.begin();
+        let handlingFailure = false;
+        let recoveryLobby = lobby;
+        const handleRegistrationFailure = async (error: unknown) => {
+          if (handlingFailure || !lobbySessionCoordinator.isCurrent(sessionTicket)) return;
+          handlingFailure = true;
+          console.error('❌ WebRTC 初始化失败:', error);
+          if (lobbySessionCoordinator.isCurrent(sessionTicket) && !useAppStore.getState().versionError) {
+            let detail = error instanceof Error ? error.message : String(error);
+            let stopped = false;
+            // EasyTier starts before WebSocket registration. A failed registration
+            // must release that session, not just the browser's WebRTC resources.
+            try {
+              await webrtcClient.cleanup();
+              if (!lobbySessionCoordinator.isCurrent(sessionTicket)) return;
+              await invoke('leave_lobby');
+              stopped = true;
+            } catch (cleanupError) {
+              console.error('注册失败后清理组网会话失败:', cleanupError);
+              detail += tl('；组网会话清理失败，请退出大厅后重试', '; Network cleanup failed; leave the lobby and retry');
+            }
+            if (!lobbySessionCoordinator.isCurrent(sessionTicket)) return;
+            if (stopped && lobby.automaticVirtualIp && lobby.serverNode) {
+              try {
+                const store = useAppStore.getState();
+                const replacement = await recoverVirtualAddress(recoveryLobby, detail, (addressAttempt) =>
+                  invoke('join_lobby', {
+                    name: lobby.name, password: lobby.password || '',
+                    playerName: store.config.playerName, playerId: store.currentPlayerId,
+                    serverNode: lobby.serverNode,
+                    signalingServer: lobby.signalingServer || 'wss://mctier.pmhs.top/signaling',
+                    useDomain: lobby.useDomain === true, addressAttempt,
+                  }), () => lobbySessionCoordinator.isCurrent(sessionTicket));
+                if (!lobbySessionCoordinator.isCurrent(sessionTicket)) return;
+                if (replacement) {
+                  store.setSignalingStatus('connecting');
+                  store.setLobby(replacement);
+                  return;
+                }
+              } catch (retryError) {
+                detail = retryError instanceof Error ? retryError.message : String(retryError);
+              }
+            } else if (lobby.automaticVirtualIp === false && isVirtualIpConflict(detail)) {
+              detail += tl('；请清空高级设置中的手动 IPv4 后重试', '; Clear the manual IPv4 in advanced settings and retry');
+            }
+            if (!lobbySessionCoordinator.isCurrent(sessionTicket)) return;
+            useAppStore.getState().setSignalingStatus('failed', sanitizeUntrustedText(
+              detail, 1024
+            ));
+          }
+        };
         try {
           const { currentPlayerId: playerId } = useAppStore.getState();
 
@@ -561,9 +612,11 @@ function MainWindowApp() {
 
           // Register observers before initialize(): it consumes register-success
           // and the first roster before resolving.
-          webrtcClient.onSignalingStatus((status) => {
+          webrtcClient.onSignalingStatus((status, error) => {
             if (lobbySessionCoordinator.isCurrent(sessionTicket)) {
-              useAppStore.getState().setSignalingStatus(status);
+              if (status === 'connected') recoveryLobby = { ...recoveryLobby, addressRecoveryStartedAt: undefined };
+              useAppStore.getState().setSignalingStatus(status, error);
+              if (status === 'failed' && error) void handleRegistrationFailure(new Error(error));
             }
           });
           webrtcClient.onPlayerJoined(
@@ -720,22 +773,7 @@ function MainWindowApp() {
             // 不阻止加入大厅，只是文件共享功能不可用
           }
         } catch (error) {
-          console.error('❌ WebRTC 初始化失败:', error);
-          if (lobbySessionCoordinator.isCurrent(sessionTicket) && !useAppStore.getState().versionError) {
-            let detail = error instanceof Error ? error.message : String(error);
-            // EasyTier starts before WebSocket registration. A failed registration
-            // must release that session, not just the browser's WebRTC resources.
-            try {
-              await invoke('leave_lobby');
-            } catch (cleanupError) {
-              console.error('注册失败后清理组网会话失败:', cleanupError);
-              detail += tl('；组网会话清理失败，请退出大厅后重试', '; Network cleanup failed; leave the lobby and retry');
-            }
-            if (!lobbySessionCoordinator.isCurrent(sessionTicket)) return;
-            useAppStore.getState().setSignalingStatus('failed', sanitizeUntrustedText(
-              detail, 1024
-            ));
-          }
+          await handleRegistrationFailure(error);
         }
       };
 

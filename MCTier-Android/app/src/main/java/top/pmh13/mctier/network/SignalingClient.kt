@@ -10,6 +10,10 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -21,11 +25,12 @@ import top.pmh13.mctier.data.MctierJson
 import top.pmh13.mctier.data.SignalingEnvelope
 import java.util.concurrent.TimeUnit
 
-class SignalingClient {
-    private val client = OkHttpClient.Builder()
+class SignalingClient(
+    private val client: WebSocket.Factory = OkHttpClient.Builder()
         .pingInterval(15, TimeUnit.SECONDS)
         .retryOnConnectionFailure(true)
-        .build()
+        .build(),
+) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     @Volatile private var webSocket: WebSocket? = null
     @Volatile private var reconnectAttempts = 0
@@ -36,6 +41,23 @@ class SignalingClient {
     @Volatile private var reconnectJob: Job? = null
     @Volatile private var stableJob: Job? = null
     @Volatile private var heartbeatJob: Job? = null
+    @Volatile private var registrationResult: CompletableDeferred<Unit>? = null
+
+    suspend fun connectAndAwaitRegistration(args: ConnectArgs) {
+        val pending = CompletableDeferred<Unit>()
+        registrationResult?.cancel()
+        registrationResult = pending
+        try {
+            connect(args)
+            withTimeout(30_000) { pending.await() }
+        } catch (error: Throwable) {
+            if (registrationResult === pending) close()
+            if (error is TimeoutCancellationException) throw IllegalStateException("大厅注册超时，请检查网络后重试")
+            throw error
+        } finally {
+            if (registrationResult === pending) registrationResult = null
+        }
+    }
 
     private val _events = MutableSharedFlow<SignalingEnvelope>(extraBufferCapacity = 64)
     val events: SharedFlow<SignalingEnvelope> = _events
@@ -93,6 +115,7 @@ class SignalingClient {
     }
 
     fun close() {
+        registrationResult?.cancel(CancellationException("Lobby session closed"))
         _connectionError.value = null
         synchronized(this) {
             connectionGeneration += 1
@@ -154,6 +177,27 @@ class SignalingClient {
                             stableJob?.cancel()
                             stableJob = scope.launch { delay(6000); if (ws === webSocket) reconnectAttempts = 0 }
                             _events.tryEmit(message)
+                            registrationResult?.complete(Unit)
+                        }
+                        "register-error" -> {
+                            val detail = message.message ?: "大厅注册失败"
+                            val pending = registrationResult
+                            // Explicit rejection is terminal for this socket. Do not
+                            // turn a password error into an endless reconnect loop.
+                            connectArgs = null
+                            serverSessionGeneration = null
+                            _connected.value = false
+                            _connectionError.value = detail
+                            reconnectJob?.cancel()
+                            stableJob?.cancel()
+                            heartbeatJob?.cancel()
+                            webSocket = null
+                            ws.close(1008, "registration-rejected")
+                            if (pending?.isActive == true) {
+                                pending.completeExceptionally(RegistrationRejected(detail))
+                            } else {
+                                _events.tryEmit(message)
+                            }
                         }
                         else -> {
                             // A top-level sessionGeneration on player-joined identifies

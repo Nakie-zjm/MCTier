@@ -46,3 +46,25 @@ Write-Output 'PASS: missing exact-version installer rejected; no older-version f
 [IO.File]::WriteAllBytes($installer, [byte[]]@())
 Assert-ExportFails '3.4.0' 'Missing Windows build artifact' (Join-Path $FixtureDirectory 'empty-installer')
 Write-Output 'PASS: empty artifact rejected before copying'
+
+$localConfig = Join-Path $FixtureDirectory 'build-paths.local.json'
+$unsetPaths = Read-MctierBuildPaths -ConfigurationPath $localConfig
+if ($unsetPaths.CargoTargetDirectory -or $unsetPaths.ReleaseRoot) { throw 'Absent local config must preserve default behavior.' }
+Write-Output 'PASS: optional local build configuration'
+
+$newCache = Join-Path $FixtureDirectory 'fresh-cache'
+$settings = @{ CargoTargetDirectory = $newCache; ReleaseRoot = $output; TemporaryDirectory = (Join-Path $FixtureDirectory 'temp') }
+[IO.File]::WriteAllText($localConfig, ($settings | ConvertTo-Json))
+$configured = Read-MctierBuildPaths -ConfigurationPath $localConfig
+if ($configured.CargoTargetDirectory -ne $newCache -or $configured.ReleaseRoot -ne $output) { throw 'Physical cache and export roots were not preserved.' }
+if (Test-Path -LiteralPath $newCache) { throw 'Reading configuration must not create cache directories.' }
+Write-Output 'PASS: explicit physical paths without filesystem mutation'
+
+[IO.File]::WriteAllText($localConfig, '{"CargoTargetDirectory":"relative/cache"}')
+$rejected = $false
+try { Read-MctierBuildPaths -ConfigurationPath $localConfig | Out-Null } catch {
+    if ($_.Exception.Message -notlike '*must be absolute*') { throw }
+    $rejected = $true
+}
+if (-not $rejected) { throw 'Relative build path was accepted.' }
+Write-Output 'PASS: ambiguous relative build path rejected'

@@ -14,7 +14,7 @@ const val ChatMaxHistoryMessages = 1000
 const val ChatMaxHistoryBytes = 12 * 1024 * 1024
 const val ChatMaxHttpBodyBytes = 12 * 1024 * 1024
 const val ChatMaxAttachmentBytes = 64 * 1024 * 1024
-const val AppClientVersion = "3.4.0"
+const val AppClientVersion = "3.5.0"
 
 enum class AppConnectionState { Idle, Connecting, InLobby, Error }
 
@@ -42,6 +42,7 @@ data class Lobby(
     val useDomain: Boolean = false,
     val signalingServer: String = DefaultSignalingServer,
     val serverNode: String = DefaultEasyTierNode,
+    val addressAttempt: Int = 0,
 )
 
 @Serializable
@@ -233,6 +234,7 @@ data class SignalingEnvelope(
     val hasPassword: Boolean? = null,
     val password: String? = null,
     val error: String? = null,
+    val message: String? = null,
     val reason: String? = null,
     val offer: SdpPayload? = null,
     val answer: SdpPayload? = null,

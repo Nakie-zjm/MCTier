@@ -114,3 +114,4 @@ __pycache__/
 *.pfx
 *.jks
 *.keystore
+build-paths.local.json

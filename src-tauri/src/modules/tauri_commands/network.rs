@@ -287,11 +287,16 @@ pub async fn check_firewall_rules() -> Result<bool, String> {
 
     #[cfg(windows)]
     {
-        let has_rules = crate::modules::privileged_helper::run_one_shot(
-            crate::modules::privileged_helper::HelperRequest::CheckFirewall,
-        )?
-        .and_then(|value| value.parse::<bool>().ok())
-        .unwrap_or(false);
+        let response = tokio::task::spawn_blocking(|| {
+            crate::modules::privileged_helper::run_one_shot(
+                crate::modules::privileged_helper::HelperRequest::CheckFirewall,
+            )
+        })
+        .await
+        .map_err(|e| format!("防火墙检查任务异常结束: {e}"))??;
+        let has_rules = response
+            .and_then(|value| value.parse::<bool>().ok())
+            .unwrap_or(false);
 
         log::info!("防火墙规则检查结果: {}", has_rules);
         Ok(has_rules)
@@ -315,7 +320,7 @@ pub async fn check_firewall_rules() -> Result<bool, String> {
 pub async fn is_admin() -> bool {
     #[cfg(windows)]
     {
-        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::Foundation::{CloseHandle, HANDLE};
         use windows::Win32::Security::{
             GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
         };
@@ -334,7 +339,9 @@ pub async fn is_admin() -> bool {
                 std::mem::size_of::<TOKEN_ELEVATION>() as u32,
                 &mut ret_len,
             );
-            ok.is_ok() && elevation.TokenIsElevated != 0
+            let elevated = ok.is_ok() && elevation.TokenIsElevated != 0;
+            let _ = CloseHandle(token);
+            elevated
         }
     }
     #[cfg(not(windows))]
@@ -353,11 +360,15 @@ pub async fn add_firewall_rules(app_handle: tauri::AppHandle) -> Result<String, 
         let easytier_path =
             crate::modules::resource_manager::ResourceManager::get_easytier_path(&app_handle)
                 .map_err(|e| e.to_string())?;
-        let value = crate::modules::privileged_helper::run_one_shot(
-            crate::modules::privileged_helper::HelperRequest::AddFirewall {
-                easytier_path: easytier_path.to_string_lossy().into_owned(),
-            },
-        )?;
+        let value = tokio::task::spawn_blocking(move || {
+            crate::modules::privileged_helper::run_one_shot(
+                crate::modules::privileged_helper::HelperRequest::AddFirewall {
+                    easytier_path: easytier_path.to_string_lossy().into_owned(),
+                },
+            )
+        })
+        .await
+        .map_err(|e| format!("防火墙配置任务异常结束: {e}"))??;
         Ok(value.unwrap_or_else(|| "防火墙规则已更新".to_string()))
     }
     #[cfg(target_os = "linux")]

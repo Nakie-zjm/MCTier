@@ -19,6 +19,10 @@ pub struct Lobby {
     pub created_at: DateTime<Utc>,
     /// 虚拟 IP 地址（当前玩家的）
     pub virtual_ip: String,
+    #[serde(default)]
+    pub automatic_virtual_ip: bool,
+    #[serde(default)]
+    pub address_attempt: u16,
     /// 创建者的虚拟 IP 地址（用于连接 WebSocket 信令服务器）
     pub creator_virtual_ip: String,
     /// 虚拟域名（如果启用了魔法DNS）
@@ -61,6 +65,8 @@ impl Lobby {
             password,
             created_at: Utc::now(),
             virtual_ip,
+            automatic_virtual_ip: false,
+            address_attempt: 0,
             creator_virtual_ip,
             virtual_domain,
             use_domain,
@@ -436,6 +442,7 @@ impl LobbyManager {
         app_handle: &tauri::AppHandle,
         global_config: Option<crate::modules::config_manager::EasyTierAdvancedConfig>,
         lobby_config: Option<crate::modules::config_manager::EasyTierAdvancedConfig>,
+        address_attempt: u16,
     ) -> Result<Lobby, LobbyError> {
         // 检查是否已经在大厅中
         if self.current_lobby.is_some() {
@@ -466,57 +473,14 @@ impl LobbyManager {
         let normalized_server_node = Self::normalize_server_node(&server_node);
         log::info!("使用服务器节点: {}", normalized_server_node);
 
-        // 创建者必须占用保留的 .1 地址。部分公共节点不运行 DHCP，
-        // 此时使用默认 dhcp=true 会让 TUN 建立但永远没有可达地址。
-        // 只对创建路径应用静态地址；加入者仍使用用户选择的 DHCP/IPv4 配置。
-        let mut creator_lobby_config = lobby_config;
-        if creator_lobby_config.is_none() {
-            // The common/default path has no per-lobby override.  In that case
-            // start_easytier would otherwise consume the global DHCP setting
-            // (the public node does not provide DHCP) and create a TUN without
-            // an address.  Materialize an explicit creator override so the
-            // final config cannot silently fall back to DHCP.
-            if let Some(global) = global_config.as_ref() {
-                if global.dhcp && global.ipv4.as_deref().unwrap_or("").trim().is_empty() {
-                    let mut static_config = global.clone();
-                    static_config.use_global_config = false;
-                    static_config.dhcp = false;
-                    static_config.ipv4 = Some("10.126.126.1/24".to_string());
-                    creator_lobby_config = Some(static_config);
-                    log::warn!("公共节点未提供 DHCP，创建者回退到静态 IPv4 10.126.126.1/24");
-                }
-            } else {
-                // No advanced settings have been persisted on a fresh install.
-                // The EasyTier default is DHCP, which is not available on the
-                // public node, so use a deterministic creator address here too.
-                let mut static_config =
-                    crate::modules::config_manager::EasyTierAdvancedConfig::default();
-                static_config.use_global_config = false;
-                static_config.dhcp = false;
-                static_config.ipv4 = Some("10.126.126.1/24".to_string());
-                creator_lobby_config = Some(static_config);
-                log::warn!("未配置 EasyTier 高级设置，创建者使用静态 IPv4 10.126.126.1/24");
-            }
-        }
-        if let Some(config) = creator_lobby_config.as_mut() {
-            if config.use_global_config {
-                if let Some(global) = global_config.as_ref() {
-                    if global.dhcp && global.ipv4.as_deref().unwrap_or("").trim().is_empty() {
-                        let mut static_config = global.clone();
-                        static_config.use_global_config = false;
-                        static_config.dhcp = false;
-                        static_config.ipv4 = Some("10.126.126.1/24".to_string());
-                        creator_lobby_config = Some(static_config);
-                        log::warn!("公共节点未提供 DHCP，创建者回退到静态 IPv4 10.126.126.1/24");
-                    }
-                }
-            } else if config.dhcp && config.ipv4.as_deref().unwrap_or("").trim().is_empty() {
-                config.use_global_config = false;
-                config.dhcp = false;
-                config.ipv4 = Some("10.126.126.1/24".to_string());
-                log::warn!("公共节点未提供 DHCP，创建者回退到静态 IPv4 10.126.126.1/24");
-            }
-        }
+        let (address_config, automatic_virtual_ip) = crate::modules::lobby_address::configuration(
+            global_config.as_ref(),
+            lobby_config.as_ref(),
+            &name,
+            player_id,
+            address_attempt,
+        )
+        .map_err(LobbyError::InvalidInput)?;
 
         // 启动 EasyTier 服务（统一启用魔法DNS），传递配置参数
         let virtual_ip = Self::start_easytier_with_retry(
@@ -527,7 +491,7 @@ impl LobbyManager {
             player_name.clone(),
             app_handle,
             Some(global_config),
-            Some(creator_lobby_config),
+            Some(Some(address_config)),
         )
         .await
         .map_err(|e| LobbyError::NetworkError(e.to_string()))?;
@@ -558,7 +522,7 @@ impl LobbyManager {
         // 分配的地址，避免对端继续访问已经失效的旧创建者地址。
         let creator_virtual_ip = virtual_ip.clone();
         log::info!("创建者 EasyTier 地址: {}", creator_virtual_ip);
-        let lobby = Lobby::new(
+        let mut lobby = Lobby::new(
             name,
             Some(password),
             virtual_ip.clone(),
@@ -567,6 +531,9 @@ impl LobbyManager {
             Some(use_domain),
             Some(signaling_server),
         );
+
+        lobby.automatic_virtual_ip = automatic_virtual_ip;
+        lobby.address_attempt = address_attempt;
 
         // 创建当前玩家
         let player = Player::new(player_name, virtual_ip.clone());
@@ -743,6 +710,7 @@ impl LobbyManager {
         app_handle: &tauri::AppHandle,
         global_config: Option<crate::modules::config_manager::EasyTierAdvancedConfig>,
         lobby_config: Option<crate::modules::config_manager::EasyTierAdvancedConfig>,
+        address_attempt: u16,
     ) -> Result<Lobby, LobbyError> {
         // 检查是否已经在大厅中
         if self.current_lobby.is_some() {
@@ -772,6 +740,15 @@ impl LobbyManager {
         let normalized_server_node = Self::normalize_server_node(&server_node);
         log::info!("使用服务器节点: {}", normalized_server_node);
 
+        let (address_config, automatic_virtual_ip) = crate::modules::lobby_address::configuration(
+            global_config.as_ref(),
+            lobby_config.as_ref(),
+            &name,
+            player_id,
+            address_attempt,
+        )
+        .map_err(LobbyError::InvalidInput)?;
+
         // 启动 EasyTier 服务（统一启用魔法DNS），传递配置参数
         let virtual_ip = Self::start_easytier_with_retry(
             network_service,
@@ -781,7 +758,7 @@ impl LobbyManager {
             player_name.clone(),
             app_handle,
             Some(global_config),
-            Some(lobby_config),
+            Some(Some(address_config)),
         )
         .await
         .map_err(|e| LobbyError::NetworkError(e.to_string()))?;
@@ -811,7 +788,7 @@ impl LobbyManager {
         // 创建大厅实例
         let creator_virtual_ip = "10.126.126.1".to_string();
         log::info!("约定的信令服务器地址: {}:8445", creator_virtual_ip);
-        let lobby = Lobby::new(
+        let mut lobby = Lobby::new(
             name,
             Some(password),
             virtual_ip.clone(),
@@ -820,6 +797,9 @@ impl LobbyManager {
             Some(use_domain),
             Some(signaling_server),
         );
+
+        lobby.automatic_virtual_ip = automatic_virtual_ip;
+        lobby.address_attempt = address_attempt;
 
         // 创建当前玩家
         let player = Player::new(player_name, virtual_ip.clone());

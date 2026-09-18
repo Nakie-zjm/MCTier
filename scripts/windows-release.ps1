@@ -1,4 +1,23 @@
 # PowerShell 5.1 compatible: access release paths directly, never recurse through junctions.
+function Read-MctierBuildPaths {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$ConfigurationPath)
+
+    $paths = [ordered]@{ CargoTargetDirectory = $null; ReleaseRoot = $null; TemporaryDirectory = $null; GradleUserHome = $null }
+    if (-not (Test-Path -LiteralPath $ConfigurationPath)) { return [pscustomobject]$paths }
+    $configuration = [IO.File]::ReadAllText($ConfigurationPath) | ConvertFrom-Json
+    foreach ($property in $configuration.PSObject.Properties) {
+        if (-not $paths.Contains($property.Name)) { throw "Unknown build path setting: $($property.Name)" }
+        $value = $property.Value
+        if ($value -isnot [string] -or $value -notmatch '^(?:[A-Za-z]:[\\/]|\\\\[^\\]+\\[^\\]+)') {
+            throw "Build path must be absolute: $($property.Name)"
+        }
+        if (Test-Path -LiteralPath $value -PathType Leaf) { throw "Build path is a file: $($property.Name)" }
+        $paths[$property.Name] = [IO.Path]::GetFullPath($value)
+    }
+    return [pscustomobject]$paths
+}
+
 function Export-MctierWindowsRelease {
     [CmdletBinding()]
     param(

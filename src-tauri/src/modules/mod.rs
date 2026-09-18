@@ -14,6 +14,7 @@ pub mod resource_manager;
 pub mod network_service;
 
 // 大厅管理模块
+pub mod lobby_address;
 pub mod lobby_manager;
 
 // Hosts文件管理模块（Magic DNS）

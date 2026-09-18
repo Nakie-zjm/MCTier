@@ -16,10 +16,10 @@ use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as AsyncBufReader};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::Mutex as AsyncMutex;
@@ -29,6 +29,8 @@ const MAX_PROTOCOL_LINE: usize = 8 * 1024 * 1024;
 const MAX_HOSTS_BYTES: usize = 1024 * 1024;
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x00200000;
+const ONE_SHOT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(45);
+const SYSTEM_COMMAND_TIMEOUT: Duration = Duration::from_secs(8);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
@@ -150,6 +152,13 @@ pub async fn start_easytier(
 /// Run a single fixed privileged operation, normally used for hosts and
 /// firewall updates before an EasyTier session exists.
 pub fn run_one_shot(request: HelperRequest) -> Result<Option<String>, String> {
+    // When MCTier itself is already elevated, starting a second copy through
+    // ShellExecute can stall behind UAC/security software. The request is still
+    // a closed enum and receives the same path validation as the helper path.
+    if is_elevated() {
+        return execute_one_shot(request);
+    }
+
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .map_err(|e| format!("无法创建特权 helper 通道: {}", e))?;
     listener
@@ -167,7 +176,7 @@ pub fn run_one_shot(request: HelperRequest) -> Result<Option<String>, String> {
     )?;
     drop(elevated);
     stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
+        .set_read_timeout(Some(ONE_SHOT_RESPONSE_TIMEOUT))
         .map_err(|e| e.to_string())?;
     stream
         .set_write_timeout(Some(Duration::from_secs(10)))
@@ -194,6 +203,28 @@ pub fn run_one_shot(request: HelperRequest) -> Result<Option<String>, String> {
                 Err(error.unwrap_or_else(|| "特权 helper 操作失败".to_string()))
             };
         }
+    }
+}
+
+fn execute_one_shot(request: HelperRequest) -> Result<Option<String>, String> {
+    match request {
+        HelperRequest::StopEasyTier => {
+            stop_existing_easytier()?;
+            cleanup_mctier_devices();
+            Ok(None)
+        }
+        HelperRequest::WriteHosts {
+            expected_sha256,
+            content,
+        } => {
+            write_hosts(&expected_sha256, &content)?;
+            Ok(None)
+        }
+        HelperRequest::AddFirewall { easytier_path } => {
+            add_firewall_rules(&easytier_path).map(Some)
+        }
+        HelperRequest::CheckFirewall => check_firewall_rules().map(|value| Some(value.to_string())),
+        HelperRequest::StartEasyTier { .. } => Err("一次性特权操作不支持启动 EasyTier".to_string()),
     }
 }
 
@@ -792,18 +823,20 @@ fn add_firewall_rules(easytier_path: &str) -> Result<String, String> {
     validate_easy_path(&easytier)?;
     let netsh = windows_paths::system_command("netsh.exe");
     for rule in firewall_policy::rules(&app, &easytier) {
-        let _ = Command::new(&netsh)
+        let mut delete = Command::new(&netsh);
+        delete
             .args(["advfirewall", "firewall", "delete", "rule"])
             .arg(format!("name={}", rule.name))
-            .creation_flags(CREATE_NO_WINDOW)
-            .output();
-        let output = Command::new(&netsh)
-            .args(["advfirewall", "firewall", "add", "rule"])
+            .creation_flags(CREATE_NO_WINDOW);
+        // A missing rule makes netsh return a non-zero status and is expected.
+        let _ = command_output_with_timeout(&mut delete, "删除旧防火墙规则")?;
+
+        let mut add = Command::new(&netsh);
+        add.args(["advfirewall", "firewall", "add", "rule"])
             .arg(format!("name={}", rule.name))
             .args(rule.arguments)
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-            .map_err(|e| format!("执行防火墙配置失败: {}", e))?;
+            .creation_flags(CREATE_NO_WINDOW);
+        let output = command_output_with_timeout(&mut add, "添加防火墙规则")?;
         if !output.status.success() {
             return Err(format!(
                 "防火墙规则 {} 配置失败: {} {}",
@@ -815,11 +848,12 @@ fn add_firewall_rules(easytier_path: &str) -> Result<String, String> {
     }
     // Retain the old rules until every replacement is installed successfully.
     for name in firewall_policy::LEGACY_RULES {
-        let _ = Command::new(&netsh)
+        let mut delete = Command::new(&netsh);
+        delete
             .args(["advfirewall", "firewall", "delete", "rule"])
             .arg(format!("name={name}"))
-            .creation_flags(CREATE_NO_WINDOW)
-            .output();
+            .creation_flags(CREATE_NO_WINDOW);
+        let _ = command_output_with_timeout(&mut delete, "清理旧版防火墙规则")?;
     }
     if !check_firewall_rules()? {
         return Err("防火墙规则更新未完成，请重新运行网络诊断中的防火墙修复".into());
@@ -842,17 +876,45 @@ fn check_firewall_rules() -> Result<bool, String> {
                 .map(|rule| (rule, false)),
         )
     {
-        let output = Command::new(&netsh)
-            .args(["advfirewall", "firewall", "show", "rule"])
+        let mut show = Command::new(&netsh);
+        show.args(["advfirewall", "firewall", "show", "rule"])
             .arg(format!("name={rule}"))
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-            .map_err(|e| format!("检查防火墙规则失败: {}", e))?;
+            .creation_flags(CREATE_NO_WINDOW);
+        let output = command_output_with_timeout(&mut show, "检查防火墙规则")?;
         if output.status.success() != should_exist {
             return Ok(false);
         }
     }
     Ok(true)
+}
+
+fn command_output_with_timeout(command: &mut Command, operation: &str) -> Result<Output, String> {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("{operation}失败: {error}"))?;
+    let deadline = Instant::now() + SYSTEM_COMMAND_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                return child
+                    .wait_with_output()
+                    .map_err(|error| format!("读取{operation}结果失败: {error}"));
+            }
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(25));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "{operation}超时，请检查 Windows 防火墙服务是否正常运行"
+                ));
+            }
+            Err(error) => return Err(format!("等待{operation}完成失败: {error}")),
+        }
+    }
 }
 
 fn stop_existing_easytier() -> Result<(), String> {
@@ -904,7 +966,7 @@ fn cleanup_mctier_devices() {
 }
 
 fn is_elevated() -> bool {
-    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
     use windows::Win32::Security::{
         GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
     };
@@ -917,7 +979,7 @@ fn is_elevated() -> bool {
         }
         let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
         let mut length = 0u32;
-        GetTokenInformation(
+        let elevated = GetTokenInformation(
             token,
             TokenElevation,
             Some(&mut elevation as *mut _ as *mut _),
@@ -925,6 +987,8 @@ fn is_elevated() -> bool {
             &mut length,
         )
         .is_ok()
-            && elevation.TokenIsElevated != 0
+            && elevation.TokenIsElevated != 0;
+        let _ = CloseHandle(token);
+        elevated
     }
 }

@@ -118,9 +118,9 @@ export const MainWindow: React.FC = () => {
         console.log('GPU 渲染设置:', gpuEnabled);
         
         if (settings.autoLobbyEnabled && settings.lobbyName && settings.playerName) {
-          console.log('检测到自动大厅配置，自动创建大厅:', settings.lobbyName);
+          console.log('检测到自动大厅配置，自动进入大厅:', settings.lobbyName);
           (window as any).__autoLobbyTriggered = true;
-          setFormMode('create');
+          setFormMode('join');
           (window as any).__autoLobbyConfig = {
             lobbyName: settings.lobbyName,
             lobbyPassword: settings.lobbyPassword,
