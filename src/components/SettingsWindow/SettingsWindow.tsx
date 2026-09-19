@@ -7,6 +7,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { useEscapeKey } from '../../hooks';
 import { RestartConfirmModal } from '../RestartConfirmModal/RestartConfirmModal';
 import { GlobalAdvancedConfigPanel } from '../GlobalAdvancedConfigPanel/GlobalAdvancedConfigPanel';
+import { NvidiaNoiseSetting } from '../VoiceSettings/NvidiaNoiseSetting';
 import { StatsPanel } from '../StatsPanel/StatsPanel';
 import { useTranslation } from 'react-i18next';
 import { getLanguagePreference, setLanguagePreference, tl, type LanguagePreference } from '../../i18n';
@@ -485,6 +486,15 @@ export const SettingsWindow: React.FC<{ onClose: () => void }> = ({ onClose }) =
           </motion.div>
 
           <Form form={form} layout="vertical" style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+            <motion.div className="settings-card" variants={itemVariants}>
+              <div className="settings-card-header">
+                <div className="settings-card-icon settings-card-icon-cyan"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 3a7 7 0 0 0-7 7v3a3 3 0 0 0 3 3h1v-6H7a5 5 0 0 1 10 0h-2v6h1a3 3 0 0 0 3-3v-3a7 7 0 0 0-7-7Zm-5 8h2v3H7v-3Zm10 0h2v3h-2v-3Z" /></svg></div>
+                <span className="settings-card-title">{tl('全局语音设置', 'Global Voice Settings')}</span>
+              </div>
+              <div className="settings-card-desc">{tl('配置所有大厅默认使用的语音降噪设备。', 'Configure the default voice noise-removal device for all lobbies.')}</div>
+              <NvidiaNoiseSetting />
+            </motion.div>
+
             <motion.div className="settings-card" variants={itemVariants}>
               <div className="settings-card-header">
                 <div className="settings-card-icon settings-card-icon-green">

@@ -4,7 +4,6 @@ import { invoke } from '@tauri-apps/api/core';
 import { useTranslation } from 'react-i18next';
 import { tl } from '../../i18n';
 import './GlobalAdvancedConfigPanel.css';
-import { NvidiaNoiseSetting } from '../VoiceSettings/NvidiaNoiseSetting';
 
 const { Panel } = Collapse;
 const VIRTUAL_IP_PREFIX = '10.126.126.';
@@ -64,12 +63,17 @@ export const GlobalAdvancedConfigPanel: React.FC = () => {
 
   return (
     <div className="global-advanced-config-panel">
-      <NvidiaNoiseSetting />
       <div className="global-advanced-config-header">
         <h3>{tl('全局 EasyTier 高级配置', 'Global EasyTier Advanced Config')}</h3>
       </div>
 
       <Form form={form} layout="vertical" onValuesChange={handleSave}>
+        <div className="global-virtual-ip-setting">
+          <Form.Item name="ipv4Host" label={tl('首选虚拟 IP 主机位', 'Preferred virtual IP host')} tooltip={tl('固定使用 10.126.126.0/24 网段；冲突时自动选择同网段未占用地址', 'The 10.126.126.0/24 subnet is fixed; conflicts fall back to another free address in the same subnet')}>
+            <InputNumber min={1} max={254} precision={0} addonBefore={VIRTUAL_IP_PREFIX} placeholder="自动分配" style={{ width: '100%' }} />
+          </Form.Item>
+          <div className="global-virtual-ip-hint">{tl('只自定义最后一段，进入大厅时优先使用；如果冲突则自动换用同一网段的空闲地址。', 'Only the last segment is customizable and preferred on lobby entry; conflicts automatically use a free address in the same subnet.')}</div>
+        </div>
         <Collapse className="advanced-config-collapse">{/* 移除 defaultActiveKey，让所有面板默认收起 */}
           {/* 网络模式 */}
           <Panel header={tl('网络模式', 'Network Mode')} key="network">
@@ -78,9 +82,6 @@ export const GlobalAdvancedConfigPanel: React.FC = () => {
             </Form.Item>
             <Form.Item name="dhcp" label={tl('启用 DHCP', 'Enable DHCP')} valuePropName="checked" tooltip={tl('自动分配虚拟 IP 地址', 'Automatically assign a virtual IP address')}>
               <Switch />
-            </Form.Item>
-            <Form.Item name="ipv4Host" label={tl('首选虚拟 IP 主机位', 'Preferred virtual IP host')} tooltip={tl('固定使用 10.126.126.0/24 网段；冲突时自动选择同网段未占用地址', 'The 10.126.126.0/24 subnet is fixed; conflicts fall back to another free address in the same subnet')}>
-              <InputNumber min={1} max={254} precision={0} addonBefore={VIRTUAL_IP_PREFIX} placeholder="自动分配" style={{ width: '100%' }} />
             </Form.Item>
           </Panel>
 

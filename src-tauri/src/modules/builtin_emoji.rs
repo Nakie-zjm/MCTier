@@ -3,6 +3,7 @@ use serde::Serialize;
 use std::collections::HashSet;
 use std::io::Read;
 use std::path::Path;
+use std::path::PathBuf;
 use tauri::path::BaseDirectory;
 use tauri::{Emitter, Manager};
 
@@ -92,8 +93,7 @@ fn replace_file(source: &Path, destination: &Path) -> Result<(), String> {
     std::fs::rename(source, destination).map_err(|error| format!("提交内置表情缓存失败: {error}"))
 }
 
-fn unpack_to_cache(pack_path: &Path, cache_dir: &Path, progress: impl Fn(usize, usize)) -> Result<Vec<String>, String> {
-    let pack = std::fs::File::open(pack_path).map_err(|error| format!("无法打开内置表情资源包: {error}"))?;
+fn unpack_reader(pack: impl Read, cache_dir: &Path, progress: impl Fn(usize, usize)) -> Result<Vec<String>, String> {
     let mut input = GzDecoder::new(std::io::BufReader::new(pack));
     let mut magic = vec![0; MAGIC.len()];
     input.read_exact(&mut magic).map_err(|_| "内置表情资源包已损坏".to_string())?;
@@ -129,6 +129,35 @@ fn unpack_to_cache(pack_path: &Path, cache_dir: &Path, progress: impl Fn(usize, 
     Ok(ids)
 }
 
+fn unpack_to_cache(pack_path: &Path, cache_dir: &Path, progress: impl Fn(usize, usize)) -> Result<Vec<String>, String> {
+    let pack = std::fs::File::open(pack_path).map_err(|error| format!("无法打开内置表情资源包: {error}"))?;
+    unpack_reader(pack, cache_dir, progress)
+}
+
+#[cfg(windows)]
+fn unpack_embedded_to_cache(cache_dir: &Path, progress: impl Fn(usize, usize)) -> Result<Vec<String>, String> {
+    use windows::{core::{w, PCWSTR}, Win32::System::LibraryLoader::{FindResourceW, GetModuleHandleW, LoadResource, LockResource, SizeofResource}};
+    unsafe {
+        let module = GetModuleHandleW(None).map_err(|error| error.to_string())?;
+        let resource = FindResourceW(module, w!("MCTIER_BUILTIN_EMOJI_PACK"), PCWSTR(11usize as *const u16));
+        if resource.0.is_null() { return Err("安装包缺少内置表情资源，请重新安装 MCTier".into()); }
+        let size = SizeofResource(module, resource) as usize;
+        let loaded = LoadResource(module, resource).map_err(|error| error.to_string())?;
+        let pointer = LockResource(loaded) as *const u8;
+        if pointer.is_null() || size == 0 { return Err("无法读取内置表情资源".into()); }
+        unpack_reader(std::io::Cursor::new(std::slice::from_raw_parts(pointer, size)), cache_dir, progress)
+    }
+}
+
+fn resource_pack_path(app: &tauri::AppHandle) -> Option<PathBuf> {
+    let relative = Path::new("builtin-emoji/builtin-v3.pack.gz");
+    let mut candidates = Vec::new();
+    if let Ok(path) = app.path().resolve(relative, BaseDirectory::Resource) { candidates.push(path); }
+    if let Ok(path) = app.path().resource_dir() { candidates.extend([path.join(relative), path.join("resources").join(relative)]); }
+    if let Ok(executable) = std::env::current_exe() { if let Some(parent) = executable.parent() { candidates.extend([parent.join(relative), parent.join("resources").join(relative)]); } }
+    candidates.into_iter().find(|path| path.is_file())
+}
+
 #[tauri::command]
 pub async fn sync_builtin_emoji(app: tauri::AppHandle) -> Result<Vec<BuiltinEmojiAsset>, String> {
     let _guard = SYNC_LOCK.lock().await;
@@ -144,11 +173,16 @@ pub async fn sync_builtin_emoji(app: tauri::AppHandle) -> Result<Vec<BuiltinEmoj
             }
         }
     }
-    let pack_path = app.path().resolve("builtin-emoji/builtin-v3.pack.gz", BaseDirectory::Resource)
-        .map_err(|error| format!("无法定位内置表情资源包: {error}"))?;
+    let pack_path = resource_pack_path(&app);
     let app_for_progress = app.clone();
     let cache_for_unpack = cache_dir.clone();
-    let ids = tokio::task::spawn_blocking(move || unpack_to_cache(&pack_path, &cache_for_unpack, |done, total| emit_progress(&app_for_progress, done, total)))
+    let ids = tokio::task::spawn_blocking(move || {
+        let progress = |done, total| emit_progress(&app_for_progress, done, total);
+        if let Some(path) = pack_path { unpack_to_cache(&path, &cache_for_unpack, progress) } else {
+            #[cfg(windows)] { unpack_embedded_to_cache(&cache_for_unpack, progress) }
+            #[cfg(not(windows))] { Err("无法定位内置表情资源包，请重新安装应用".to_string()) }
+        }
+    })
         .await.map_err(|error| format!("解压内置表情任务失败: {error}"))??;
     Ok(assets(&cache_dir, &ids))
 }
