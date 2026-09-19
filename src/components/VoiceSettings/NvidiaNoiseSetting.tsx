@@ -15,12 +15,12 @@ export function NvidiaNoiseSetting({ lobby = false }: { lobby?: boolean }) {
     navigator.mediaDevices?.addEventListener('devicechange', refresh);
     return () => { disposed = true; navigator.mediaDevices?.removeEventListener('devicechange', refresh); };
   }, []);
-  return <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBlock: 12 }}>
-    <div style={{ flex: 1 }}>
+  return <div style={{ display: 'flex', alignItems: 'center', gap: 12, margin: '12px 14px', minWidth: 0 }}>
+    <div style={{ flex: 1, minWidth: 0 }}>
       <Typography.Text>{tl('NVIDIA AI 语音降噪', 'NVIDIA AI Noise Removal')}</Typography.Text>
       <div><Typography.Text type="secondary">{available ? 'NVIDIA Broadcast / RTX Voice' : tl('未检测到 NVIDIA Broadcast / RTX Voice 麦克风', 'NVIDIA Broadcast / RTX Voice microphone unavailable')}</Typography.Text></div>
     </div>
-    <Switch checked={enabled && available} disabled={!available} onChange={value => {
+    <Switch style={{ flexShrink: 0 }} checked={enabled && available} disabled={!available} onChange={value => {
       setEnabled(value); setNvidiaNoiseMode(value ? 'auto' : 'off', lobby);
       void webrtcClient.refreshMicrophoneProcessing().catch(() => message.error(tl('切换降噪失败，请重新开启麦克风', 'Could not switch noise removal. Re-enable the microphone')));
     }} />
