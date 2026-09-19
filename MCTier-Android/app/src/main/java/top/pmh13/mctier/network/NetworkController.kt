@@ -45,13 +45,14 @@ class NetworkController(private val context: Context) {
         useDomain: Boolean = false,
         identityId: String,
         addressAttempt: Int = 0,
+        preferredVirtualIpHost: Int? = null,
     ): NetworkSession {
         val networkName = "MCTier-$lobbyName"
         val instanceName = "mctier_${lobbyName.hashCode().absoluteValue}_${playerName.hashCode().absoluteValue}"
         val normalizedNode = normalizeNode(node)
         // 只连接用户当前选择的节点，确保节点选择和实际网络连接保持一致。
         val peerList = listOf(normalizedNode)
-        val virtualIp = LobbyAddress.candidate(lobbyName, identityId, addressAttempt)
+        val virtualIp = LobbyAddress.candidate(lobbyName, identityId, addressAttempt, preferredVirtualIpHost)
         Log.i(TAG, "Starting EasyTier instance=$instanceName ip=$virtualIp peers=$peerList lobby=$lobbyName")
         if (!EasyTierJNI.available) {
             error("EasyTier native load failed: ${EasyTierJNI.loadErrorMessage ?: "unknown error"}")

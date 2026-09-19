@@ -1,6 +1,22 @@
 use super::config_manager::EasyTierAdvancedConfig;
 use sha2::{Digest, Sha256};
 
+const SUBNET_PREFIX: &str = "10.126.126.";
+
+fn configured_host(raw: &str) -> Result<u8, String> {
+    let value = raw.trim();
+    let (address, prefix) = value.split_once('/').map_or((value, None), |(ip, prefix)| (ip, Some(prefix)));
+    if prefix.is_some_and(|prefix| prefix != "24") {
+        return Err(format!("虚拟 IP 必须使用固定网段 {SUBNET_PREFIX}0/24"));
+    }
+    let host = address.strip_prefix(SUBNET_PREFIX)
+        .ok_or_else(|| format!("虚拟 IP 必须位于固定网段 {SUBNET_PREFIX}0/24"))?
+        .parse::<u8>()
+        .map_err(|_| "虚拟 IP 主机位必须是 1 到 254".to_string())?;
+    if !(1..=254).contains(&host) { return Err("虚拟 IP 主机位必须是 1 到 254".into()); }
+    Ok(host)
+}
+
 /// Every candidate is visited once. Registration, not a hash, decides ownership.
 pub fn candidate(lobby: &str, identity: &str, attempt: u16) -> Result<String, String> {
     if attempt >= 254 {
@@ -28,13 +44,17 @@ pub fn configuration(
         .or(global)
         .cloned()
         .unwrap_or_default();
-    let automatic = config.ipv4.as_deref().unwrap_or("").trim().is_empty();
-    if automatic {
+    let configured = config.ipv4.as_deref().unwrap_or("").trim();
+    let preferred_host = (!configured.is_empty()).then(|| configured_host(configured)).transpose()?;
+    let automatic = configured.is_empty() || attempt != 0;
+    if configured.is_empty() || attempt != 0 {
         config.ipv4 = Some(format!("{}/24", candidate(name, identity, attempt)?));
         // Static addresses also work when the first participant has no EasyTier peers.
         config.dhcp = false;
-    } else if attempt != 0 {
-        return Err("手动指定的虚拟 IP 已被占用，请清空手动 IPv4 后重试".into());
+    } else {
+        let host = preferred_host.expect("non-empty configuration has a validated host");
+        config.ipv4 = Some(format!("{SUBNET_PREFIX}{host}/24"));
+        config.dhcp = false;
     }
     config.use_global_config = false;
     Ok((config, automatic))
@@ -88,12 +108,25 @@ mod tests {
                 .unwrap()
                 .1
         );
-        assert!(configuration(Some(&global), Some(&lobby), "r", "a", 1).is_err());
+        let (fallback, automatic) = configuration(Some(&global), Some(&lobby), "r", "a", 1).unwrap();
+        assert!(automatic);
+        assert_ne!(fallback.ipv4, global.ipv4);
         lobby.use_global_config = false;
         assert!(
             configuration(Some(&global), Some(&lobby), "r", "a", 1)
                 .unwrap()
                 .1
         );
+    }
+
+    #[test]
+    fn manual_address_is_limited_to_fixed_subnet_and_host_bits() {
+        let mut global = EasyTierAdvancedConfig::default();
+        global.ipv4 = Some("10.126.126.20/24".into());
+        let (config, automatic) = configuration(Some(&global), None, "r", "a", 0).unwrap();
+        assert!(!automatic);
+        assert_eq!(config.ipv4.as_deref(), Some("10.126.126.20/24"));
+        global.ipv4 = Some("10.144.144.20/24".into());
+        assert!(configuration(Some(&global), None, "r", "a", 0).is_err());
     }
 }

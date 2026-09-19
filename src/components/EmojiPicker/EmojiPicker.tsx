@@ -352,14 +352,6 @@ export const EmojiPicker: React.FC<EmojiPickerProps> = ({ onSelect }) => {
         </div>
       )}
       <div className="emoji-grid">
-        {activeCategory === 'builtin' && builtinProgress.retryAfterSeconds && (
-          <div className="emoji-download-status" role="status">
-            {tl(
-              `下载暂时中断，${builtinProgress.retryAfterSeconds} 秒后自动重试`,
-              `Download interrupted. Retrying in ${builtinProgress.retryAfterSeconds}s`
-            )}
-          </div>
-        )}
         {visibleItems.map((emoji) => (
           <div
             key={emoji.id}

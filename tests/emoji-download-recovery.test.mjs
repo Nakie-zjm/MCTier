@@ -14,18 +14,15 @@ const bundled = await build({
   } }],
 });
 
-test('failed downloads retry automatically with capped backoff, one shared job and detachable progress', async () => {
-  const originalTimeout = globalThis.setTimeout;
-  const delays = [], progress = [], closedProgress = [];
+test('failed local extraction reports once without download retries', async () => {
+  const progress = [], closedProgress = [];
   let emit, calls = 0, stopCount = 0, listenerCount = 0;
-  globalThis.setTimeout = (fn, ms) => { delays.push(ms); queueMicrotask(fn); return 1; };
   globalThis.emojiFixture = {
     listen: async (_name, cb) => { listenerCount++; emit = cb; return () => stopCount++; },
     invoke: async () => {
       calls++;
-      emit({ payload: { downloaded: 4, total: 5 } });
-      if (calls <= 8) throw new Error('temporarily offline');
-      return Array.from({ length: 5 }, (_, i) => ({ id: `builtin-${i}`, name: String(i), path: `/cache/${i}.gif` }));
+      emit({ payload: { downloaded: 0, total: 5 } });
+      throw new Error('内置表情资源包已损坏');
     },
   };
   try {
@@ -33,21 +30,14 @@ test('failed downloads retry automatically with capped backoff, one shared job a
     const controller = new AbortController();
     const first = syncBuiltinEmojiItems(false, p => closedProgress.push(p), controller.signal);
     controller.abort();
-    const second = syncBuiltinEmojiItems(true, p => progress.push(p));
-    const [a, b] = await Promise.all([first, second]);
-    assert.strictEqual(a, b);
-    assert.equal(calls, 9);
-    assert.equal(listenerCount, 1);
-    assert.equal(stopCount, 1);
-    assert.deepEqual(delays, [2000, 4000, 8000, 16000, 32000, 60000, 60000, 60000]);
+    await assert.rejects(first, /内置表情资源包已损坏/);
+    await assert.rejects(syncBuiltinEmojiItems(true, p => progress.push(p)), /内置表情资源包已损坏/);
+    assert.equal(calls, 2);
+    assert.equal(listenerCount, 2);
+    assert.equal(stopCount, 2);
     assert.equal(closedProgress.length, 1);
-    assert.deepEqual(progress.at(-1), { downloaded: 5, total: 5 });
-    assert.ok(progress.some(p => p.downloaded === 4 && p.retryAfterSeconds === 60));
-    assert.equal(a[0].dataUrl, 'asset:/cache/0.gif');
-    await syncBuiltinEmojiItems();
-    assert.equal(calls, 9);
+    assert.ok(progress.some(p => p.error?.includes('内置表情资源包已损坏')));
   } finally {
-    globalThis.setTimeout = originalTimeout;
     delete globalThis.emojiFixture;
   }
 });

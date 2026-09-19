@@ -19,6 +19,11 @@ class LobbyAddressTest {
         assertEquals(ips.first(), LobbyAddress.candidate("room", "alice", 0))
     }
 
+    @Test fun preferredHostWinsFirstAndCollisionFallsBackToAutomaticCandidate() {
+        assertEquals("10.126.126.42", LobbyAddress.candidate("room", "alice", 0, 42))
+        assertEquals("10.126.126.228", LobbyAddress.candidate("room", "alice", 1, 42))
+    }
+
     @Test fun collisionRetriesButPasswordErrorsDoNot() = runBlocking {
         val attempts = mutableListOf<Int>()
         val result = LobbyAddress.recover { attempt ->

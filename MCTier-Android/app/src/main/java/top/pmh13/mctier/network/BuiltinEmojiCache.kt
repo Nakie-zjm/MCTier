@@ -39,6 +39,8 @@ class BuiltinEmojiCache private constructor(
         }
         withContext(Dispatchers.IO) {
             check(cacheDirectory.mkdirs() || cacheDirectory.isDirectory) { "无法创建内置表情缓存目录" }
+            marker.delete()
+            cacheDirectory.listFiles()?.filter { it.extension == "gif" || it.extension == "part" || it.extension == "tmp" }?.forEach { it.delete() }
             unpack(onProgress)
         }
     }
@@ -50,6 +52,7 @@ class BuiltinEmojiCache private constructor(
             check(magic.contentEquals(Magic)) { "内置表情资源包版本不兼容" }
             val count = input.readU32().toInt()
             check(count in MinEmojiCount..MaxEmojiCount) { "内置表情数量异常" }
+            onProgress(0, count)
             var totalBytes = 0L
             repeat(count) { index ->
                 val idLength = input.readU16()

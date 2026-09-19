@@ -22,7 +22,7 @@ class BuiltinEmojiCacheTest {
             assertEquals(100, cache.sync { done, total -> progress += done to total }.size)
             assertTrue(cache.isComplete())
             assertEquals(1, opens)
-            assertEquals(1 to 100, progress.first())
+            assertEquals(0 to 100, progress.first())
             assertEquals(100 to 100, progress.last())
             assertEquals(100, BuiltinEmojiCache.fromTestInput(root) { opens += 1; ByteArrayInputStream(pack) }.sync().size)
             assertEquals(1, opens)

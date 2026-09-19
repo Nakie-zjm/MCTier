@@ -483,6 +483,7 @@ class MctierRepository(private val context: Context) {
             putString("fileShareDownloadTreeUri", normalizedSettings.fileShareDownloadTreeUri)
             putString("preferredServer", settings.preferredServer)
             putString("signalingServer", settings.signalingServer)
+            if (settings.preferredVirtualIpHost == null) remove("preferredVirtualIpHost") else putInt("preferredVirtualIpHost", settings.preferredVirtualIpHost)
             putBoolean("useDomain", settings.useDomain)
             putString("virtualDomain", settings.virtualDomain)
             putBoolean("autoLobbyEnabled", settings.autoLobbyEnabled)
@@ -623,7 +624,7 @@ class MctierRepository(private val context: Context) {
                 if (!isCurrentLobbyGeneration(generation)) return@launch
                 _state.update { it.copy(state = AppConnectionState.Connecting, error = null, playerId = identityId) }
                 runCatching {
-                    LobbyAddress.recover(addressAttempt) { attempt ->
+                    LobbyAddress.recover(addressAttempt, preferredHost = settings.preferredVirtualIpHost) { attempt ->
                         var accepted = false
                         try {
                             val session = networkController.startEasyTier(
@@ -646,6 +647,7 @@ class MctierRepository(private val context: Context) {
                                 useDomain = false,
                                 identityId = identityId,
                                 addressAttempt = attempt,
+                                preferredVirtualIpHost = settings.preferredVirtualIpHost,
                             )
                             if (!isCurrentLobbyGeneration(generation)) throw CancellationException("Lobby session superseded")
                             val lobby = Lobby(
@@ -3065,41 +3067,34 @@ class MctierRepository(private val context: Context) {
         if (builtinEmojiSyncJob?.isActive == true) return
         _state.update { it.copy(emojiBuiltinSyncing = true, emojiBuiltinError = null, emojiBuiltinDownloaded = 0, emojiBuiltinTotal = 0) }
         builtinEmojiSyncJob = ioScope.launch {
-            var retryDelay = 2_000L
-            while (true) {
-                _state.update { it.copy(emojiBuiltinError = null) }
-                runCatching { builtinEmojiCache.sync { downloaded, total ->
-                    _state.update { it.copy(emojiBuiltinDownloaded = downloaded, emojiBuiltinTotal = total) }
-                } }
-                    .onSuccess { builtin ->
-                        withContext(Dispatchers.Main) {
-                            _state.update { current ->
-                                current.copy(
-                                    customEmojiItems = builtin + current.customEmojiItems.filterNot { it.categoryId == "builtin" },
-                                    emojiBuiltinSyncing = false,
-                                    emojiBuiltinError = null,
-                                )
-                            }
-                        }
-                        return@launch
-                    }
-                    .onFailure { error ->
-                        if (error is kotlinx.coroutines.CancellationException) throw error
-                        Log.w(TAG, "Built-in emoji synchronization failed", error)
-                        val available = builtinEmojiCache.cachedItems()
-                        withContext(Dispatchers.Main) {
-                            _state.update {
-                                it.copy(
-                                    customEmojiItems = available + it.customEmojiItems.filterNot { emoji -> emoji.categoryId == "builtin" },
-                                    emojiBuiltinSyncing = true,
-                                    emojiBuiltinError = error.message ?: "download failed",
-                                )
-                            }
+            runCatching { builtinEmojiCache.sync { downloaded, total ->
+                _state.update { it.copy(emojiBuiltinDownloaded = downloaded, emojiBuiltinTotal = total) }
+            } }
+                .onSuccess { builtin ->
+                    withContext(Dispatchers.Main) {
+                        _state.update { current ->
+                            current.copy(
+                                customEmojiItems = builtin + current.customEmojiItems.filterNot { it.categoryId == "builtin" },
+                                emojiBuiltinSyncing = false,
+                                emojiBuiltinError = null,
+                            )
                         }
                     }
-                kotlinx.coroutines.delay(retryDelay)
-                retryDelay = (retryDelay * 2).coerceAtMost(60_000L)
-            }
+                }
+                .onFailure { error ->
+                    if (error is kotlinx.coroutines.CancellationException) throw error
+                    Log.w(TAG, "Built-in emoji extraction failed", error)
+                    val available = builtinEmojiCache.cachedItems()
+                    withContext(Dispatchers.Main) {
+                        _state.update {
+                            it.copy(
+                                customEmojiItems = available + it.customEmojiItems.filterNot { emoji -> emoji.categoryId == "builtin" },
+                                emojiBuiltinSyncing = false,
+                                emojiBuiltinError = error.message ?: "内置表情解压失败",
+                            )
+                        }
+                    }
+                }
         }
     }
 
@@ -3133,6 +3128,7 @@ class MctierRepository(private val context: Context) {
             ?.takeUnless { it == RemovedQingyunNode }
             ?: UserSettings().preferredServer,
         signalingServer = prefs.getString("signalingServer", null) ?: UserSettings().signalingServer,
+        preferredVirtualIpHost = prefs.getInt("preferredVirtualIpHost", 0).takeIf { it in 1..254 },
         useDomain = prefs.getBoolean("useDomain", false),
         virtualDomain = prefs.getString("virtualDomain", null).orEmpty(),
         autoLobbyEnabled = prefs.getBoolean("autoLobbyEnabled", false),

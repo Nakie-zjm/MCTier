@@ -27,7 +27,6 @@ interface NativeBuiltinEmoji {
 export interface BuiltinEmojiProgress {
   downloaded: number;
   total: number;
-  retryAfterSeconds?: number;
   error?: string;
 }
 
@@ -170,17 +169,13 @@ export async function syncBuiltinEmojiItems(_retry = false, onProgress?: (progre
           ...event.payload, downloaded: Math.max(builtinProgress.downloaded, event.payload.downloaded),
         }));
         try {
-          let failures = 0;
-          for (;;) {
-            try {
-              const items = await invoke<NativeBuiltinEmoji[]>('sync_builtin_emoji');
-              publishBuiltinProgress({ downloaded: items.length, total: items.length });
-              return items;
-            } catch (error) {
-              const seconds = Math.min(60, 2 ** Math.min(++failures, 6));
-              publishBuiltinProgress({ ...builtinProgress, retryAfterSeconds: seconds, error: String(error) });
-              await new Promise(resolve => setTimeout(resolve, seconds * 1000));
-            }
+          try {
+            const items = await invoke<NativeBuiltinEmoji[]>('sync_builtin_emoji');
+            publishBuiltinProgress({ downloaded: items.length, total: items.length });
+            return items;
+          } catch (error) {
+            publishBuiltinProgress({ ...builtinProgress, error: String(error) });
+            throw error;
           }
         } finally { unlisten(); }
       })().then((items) => items.map((item) => ({

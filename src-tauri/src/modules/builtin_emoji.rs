@@ -100,6 +100,7 @@ fn unpack_to_cache(pack_path: &Path, cache_dir: &Path, progress: impl Fn(usize, 
     if magic != MAGIC { return Err("内置表情资源包版本不兼容".into()); }
     let count = read_u32(&mut input)? as usize;
     if !(MIN_EMOJI_COUNT..=MAX_EMOJI_COUNT).contains(&count) { return Err("内置表情数量异常".into()); }
+    progress(0, count);
     let mut ids = Vec::with_capacity(count);
     let mut total_bytes = 0usize;
     for index in 0..count {
@@ -134,6 +135,15 @@ pub async fn sync_builtin_emoji(app: tauri::AppHandle) -> Result<Vec<BuiltinEmoj
     let cache_dir = app.path().app_cache_dir().map_err(|error| format!("无法定位应用缓存目录: {error}"))?.join("emoji-builtin-v3");
     std::fs::create_dir_all(&cache_dir).map_err(|error| format!("无法创建表情缓存目录: {error}"))?;
     if let Some(cached) = completed_cache(&cache_dir) { emit_progress(&app, cached.len(), cached.len()); return Ok(cached); }
+    let _ = std::fs::remove_file(cache_dir.join("complete-v3.txt"));
+    if let Ok(entries) = std::fs::read_dir(&cache_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "gif" || ext == "part" || ext == "tmp") {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
     let pack_path = app.path().resolve("builtin-emoji/builtin-v3.pack.gz", BaseDirectory::Resource)
         .map_err(|error| format!("无法定位内置表情资源包: {error}"))?;
     let app_for_progress = app.clone();

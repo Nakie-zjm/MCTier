@@ -136,6 +136,7 @@ data class UserSettings(
     val fileShareDownloadTreeUri: String = "",
     val preferredServer: String = DefaultEasyTierNode,
     val signalingServer: String = DefaultSignalingServer,
+    val preferredVirtualIpHost: Int? = null,
     val useDomain: Boolean = false,
     val virtualDomain: String = "",
     val autoLobbyEnabled: Boolean = false,

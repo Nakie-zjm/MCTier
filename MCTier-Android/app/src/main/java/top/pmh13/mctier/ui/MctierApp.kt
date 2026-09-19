@@ -3007,7 +3007,6 @@ private fun ChatTab(state: MctierUiState, repository: MctierRepository) {
                         }
                         Text(
                             when {
-                                emojiCat == "builtin" && state.emojiBuiltinError != null && state.emojiBuiltinSyncing -> L("内置表情准备中断，正在重试", "Built-in emoji preparation interrupted; retrying")
                                 emojiCat == "builtin" && state.emojiBuiltinSyncing -> L("正在解压内置表情...", "Extracting built-in emoji...")
                                 emojiCat == "builtin" && state.emojiBuiltinError != null -> L("内置表情准备失败", "Built-in emoji preparation failed")
                                 emojiCat == "builtin" -> L("内置表情资源尚未安装", "Built-in emoji are not installed")
@@ -3029,8 +3028,7 @@ private fun ChatTab(state: MctierUiState, repository: MctierRepository) {
                     if (emojiCat == "builtin" && (state.emojiBuiltinSyncing || state.emojiBuiltinError != null)) {
                         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                             Text(
-                                if (state.emojiBuiltinSyncing && state.emojiBuiltinError != null) L("正在重试，已解压 ${state.emojiBuiltinDownloaded}/${state.emojiBuiltinTotal}", "Retrying, ${state.emojiBuiltinDownloaded}/${state.emojiBuiltinTotal} extracted")
-                                else if (state.emojiBuiltinSyncing) L("正在解压表情 ${state.emojiBuiltinDownloaded}/${state.emojiBuiltinTotal}", "Extracting ${state.emojiBuiltinDownloaded}/${state.emojiBuiltinTotal}")
+                                if (state.emojiBuiltinSyncing) L("正在解压表情 ${state.emojiBuiltinDownloaded}/${state.emojiBuiltinTotal}", "Extracting ${state.emojiBuiltinDownloaded}/${state.emojiBuiltinTotal}")
                                 else state.emojiBuiltinError.orEmpty(),
                                 modifier = Modifier.weight(1f), color = TextPrimary.copy(alpha = .65f), fontSize = 11.sp, maxLines = 2, overflow = TextOverflow.Ellipsis,
                             )
@@ -4961,6 +4959,12 @@ private fun SettingsPanel(state: MctierUiState, repository: MctierRepository) {
         }
         if (advancedOpen) {
             MctierField(settings.mtu.toString(), { v -> onChange(settings.copy(mtu = v.filter { it.isDigit() }.toIntOrNull() ?: settings.mtu)) }, L("MTU（默认 1420）", "MTU (default 1420)"))
+            Spacer(Modifier.height(8.dp))
+            MctierField(settings.preferredVirtualIpHost?.toString().orEmpty(), { value ->
+                val host = value.filter { it.isDigit() }.toIntOrNull()?.takeIf { it in 1..254 }
+                onChange(settings.copy(preferredVirtualIpHost = host))
+            }, L("首选虚拟 IP 主机位（10.126.126.）", "Preferred virtual IP host (10.126.126.)"))
+            Text(L("仅自定义固定网段的最后一段；若与大厅成员冲突，会自动换用同网段其他地址。", "Only the last octet of the fixed subnet is customizable; conflicts automatically use another address in the same subnet."), color = TextPrimary.copy(alpha = .55f), fontSize = 11.sp)
             Spacer(Modifier.height(8.dp))
             SwitchRow(L("延迟优先", "Latency first"), settings.latencyFirst) { onChange(settings.copy(latencyFirst = it)) }
             Spacer(Modifier.height(8.dp))

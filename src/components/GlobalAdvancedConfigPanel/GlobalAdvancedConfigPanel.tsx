@@ -7,6 +7,13 @@ import './GlobalAdvancedConfigPanel.css';
 import { NvidiaNoiseSetting } from '../VoiceSettings/NvidiaNoiseSetting';
 
 const { Panel } = Collapse;
+const VIRTUAL_IP_PREFIX = '10.126.126.';
+
+function hostFromVirtualIp(value: unknown): number | undefined {
+  const match = String(value ?? '').trim().match(/^10\.126\.126\.(\d{1,3})(?:\/24)?$/);
+  const host = match ? Number(match[1]) : undefined;
+  return host && host >= 1 && host <= 254 ? host : undefined;
+}
 
 export const GlobalAdvancedConfigPanel: React.FC = () => {
   useTranslation();
@@ -22,7 +29,7 @@ export const GlobalAdvancedConfigPanel: React.FC = () => {
     try {
       const config = await invoke<any>('get_global_easytier_advanced_config');
       console.log('已加载全局高级配置');
-      form.setFieldsValue(config);
+      form.setFieldsValue({ ...config, ipv4Host: hostFromVirtualIp(config.ipv4) });
     } catch (error) {
       console.error('加载全局高级配置失败:', error);
       message.error(tl('加载配置失败', 'Failed to load configuration'));
@@ -34,9 +41,12 @@ export const GlobalAdvancedConfigPanel: React.FC = () => {
   const handleSave = async () => {
     try {
       const values = form.getFieldsValue(true);
-      console.log('保存全局高级配置:', values);
+      const host = Number(values.ipv4Host);
+      const config = { ...values, ipv4: host >= 1 && host <= 254 ? `${VIRTUAL_IP_PREFIX}${host}/24` : null };
+      delete config.ipv4Host;
+      console.log('保存全局高级配置:', config);
       
-      await invoke('save_global_easytier_advanced_config', { configJson: values });
+      await invoke('save_global_easytier_advanced_config', { configJson: config });
       message.success(tl('全局高级配置已保存', 'Global advanced config saved'), 1);
     } catch (error) {
       console.error('保存全局高级配置失败:', error);
@@ -69,8 +79,8 @@ export const GlobalAdvancedConfigPanel: React.FC = () => {
             <Form.Item name="dhcp" label={tl('启用 DHCP', 'Enable DHCP')} valuePropName="checked" tooltip={tl('自动分配虚拟 IP 地址', 'Automatically assign a virtual IP address')}>
               <Switch />
             </Form.Item>
-            <Form.Item name="ipv4" label={tl('手动指定 IPv4', 'Manual IPv4')} tooltip={tl('例如：10.144.144.1/24', 'e.g. 10.144.144.1/24')}>
-              <Input placeholder="10.144.144.1/24" />
+            <Form.Item name="ipv4Host" label={tl('首选虚拟 IP 主机位', 'Preferred virtual IP host')} tooltip={tl('固定使用 10.126.126.0/24 网段；冲突时自动选择同网段未占用地址', 'The 10.126.126.0/24 subnet is fixed; conflicts fall back to another free address in the same subnet')}>
+              <InputNumber min={1} max={254} precision={0} addonBefore={VIRTUAL_IP_PREFIX} placeholder="自动分配" style={{ width: '100%' }} />
             </Form.Item>
           </Panel>
 
